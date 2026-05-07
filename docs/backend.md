@@ -44,7 +44,7 @@ defmodule Temporalex.Backend do
 end
 ```
 
-Client operations currently live on `Temporalex.Client` and use the opaque Temporal Core backend state for workflow start/result calls. Signal, update, query, cancel, and terminate operations can be added later as separate callbacks or a separate client backend.
+Client operations currently live on `Temporalex.Client` and use the opaque Temporal Core backend state for workflow start/result, signal, query, update, cancel, terminate, and describe calls. A later standalone client backend can split these operations away from worker-owned backend state without changing executor semantics.
 
 ## Backend Messages
 

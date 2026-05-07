@@ -142,6 +142,7 @@ defmodule Temporalex.Backend.TemporalCore do
              workflow_type,
              task_queue,
              input,
+             native_start_opts(opts),
              self(),
              ref
            ) do
@@ -167,6 +168,127 @@ defmodule Temporalex.Backend.TemporalCore do
     end
   end
 
+  def signal_workflow(%State{} = state, workflow_id, run_id, signal_name, args, opts)
+      when is_binary(workflow_id) and is_binary(signal_name) and is_list(opts) do
+    timeout = Keyword.get(opts, :timeout, state.completion_timeout)
+    ref = make_ref()
+
+    with :ok <-
+           Native.signal_workflow(
+             state.client,
+             state.namespace,
+             workflow_id,
+             empty_to_nil(run_id),
+             signal_name,
+             List.wrap(args),
+             native_headers_opts(opts),
+             self(),
+             ref
+           ) do
+      await_ok_ref(:workflow_signalled, ref, timeout)
+    end
+  end
+
+  def query_workflow(%State{} = state, workflow_id, run_id, query_name, args, opts)
+      when is_binary(workflow_id) and is_binary(query_name) and is_list(opts) do
+    timeout = Keyword.get(opts, :timeout, state.completion_timeout)
+    ref = make_ref()
+
+    with :ok <-
+           Native.query_workflow(
+             state.client,
+             state.namespace,
+             workflow_id,
+             empty_to_nil(run_id),
+             query_name,
+             List.wrap(args),
+             native_headers_opts(opts),
+             self(),
+             ref
+           ) do
+      await_ref(:workflow_queried, ref, timeout)
+    end
+  end
+
+  def update_workflow(%State{} = state, workflow_id, run_id, update_name, args, opts)
+      when is_binary(workflow_id) and is_binary(update_name) and is_list(opts) do
+    timeout = Keyword.get(opts, :timeout, state.workflow_result_timeout)
+    ref = make_ref()
+
+    with :ok <-
+           Native.update_workflow(
+             state.client,
+             state.namespace,
+             workflow_id,
+             empty_to_nil(run_id),
+             update_name,
+             List.wrap(args),
+             native_headers_opts(opts),
+             self(),
+             ref
+           ) do
+      await_ref(:workflow_updated, ref, timeout)
+    end
+  end
+
+  def cancel_workflow(%State{} = state, workflow_id, run_id, opts)
+      when is_binary(workflow_id) and is_list(opts) do
+    timeout = Keyword.get(opts, :timeout, state.completion_timeout)
+    ref = make_ref()
+
+    with :ok <-
+           Native.cancel_workflow(
+             state.client,
+             state.namespace,
+             workflow_id,
+             empty_to_nil(run_id),
+             to_string(Keyword.get(opts, :reason, "")),
+             Keyword.get(opts, :request_id),
+             self(),
+             ref
+           ) do
+      await_ok_ref(:workflow_cancelled, ref, timeout)
+    end
+  end
+
+  def terminate_workflow(%State{} = state, workflow_id, run_id, opts)
+      when is_binary(workflow_id) and is_list(opts) do
+    timeout = Keyword.get(opts, :timeout, state.completion_timeout)
+    ref = make_ref()
+
+    with :ok <-
+           Native.terminate_workflow(
+             state.client,
+             state.namespace,
+             workflow_id,
+             empty_to_nil(run_id),
+             to_string(Keyword.get(opts, :reason, "")),
+             Keyword.get(opts, :details),
+             self(),
+             ref
+           ) do
+      await_ok_ref(:workflow_terminated, ref, timeout)
+    end
+  end
+
+  def describe_workflow(%State{} = state, workflow_id, run_id, opts)
+      when is_binary(workflow_id) and is_list(opts) do
+    timeout = Keyword.get(opts, :timeout, state.completion_timeout)
+    ref = make_ref()
+
+    with :ok <-
+           Native.describe_workflow(
+             state.client,
+             state.namespace,
+             workflow_id,
+             empty_to_nil(run_id),
+             self(),
+             ref
+           ) do
+      await_ref(:workflow_described, ref, timeout)
+    end
+  end
+
   defp target(opts) do
     Keyword.get(opts, :target) ||
       Keyword.get(opts, :url) ||
@@ -184,6 +306,47 @@ defmodule Temporalex.Backend.TemporalCore do
 
   defp normalize_headers(headers) do
     Map.new(headers, fn {key, value} -> {to_string(key), to_string(value)} end)
+  end
+
+  defp native_start_opts(opts) do
+    opts
+    |> Keyword.take([
+      :headers,
+      :execution_timeout,
+      :workflow_execution_timeout,
+      :run_timeout,
+      :workflow_run_timeout,
+      :task_timeout,
+      :workflow_task_timeout,
+      :cron_schedule,
+      :search_attributes,
+      :retry_policy,
+      :id_reuse_policy,
+      :workflow_id_reuse_policy,
+      :id_conflict_policy,
+      :workflow_id_conflict_policy,
+      :static_summary,
+      :static_details
+    ])
+    |> normalize_native_opts()
+  end
+
+  defp native_headers_opts(opts) do
+    opts
+    |> Keyword.take([:headers, :request_id, :update_id])
+    |> normalize_native_opts()
+  end
+
+  defp normalize_native_opts(opts) do
+    opts
+    |> Keyword.update(:headers, %{}, &normalize_header_payload_keys/1)
+    |> Keyword.update(:search_attributes, nil, &normalize_header_payload_keys/1)
+  end
+
+  defp normalize_header_payload_keys(nil), do: %{}
+
+  defp normalize_header_payload_keys(headers) do
+    Map.new(headers, fn {key, value} -> {to_string(key), value} end)
   end
 
   defp workflow_poller_count(opts) do
@@ -233,6 +396,13 @@ defmodule Temporalex.Backend.TemporalCore do
       {^tag, ^ref, {:error, reason}} -> {:error, reason}
     after
       timeout -> {:error, {tag, :timeout, timeout}}
+    end
+  end
+
+  defp await_ok_ref(tag, ref, timeout) do
+    case await_ref(tag, ref, timeout) do
+      {:ok, :ok} -> :ok
+      other -> other
     end
   end
 

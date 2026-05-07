@@ -28,7 +28,7 @@ Test evidence:
 
 - `CARGO_HOME=$(pwd)/.cargo-home cargo check --manifest-path native/temporalex_nif/Cargo.toml`: success.
 - `CARGO_HOME=$(pwd)/.cargo-home mix compile`: success.
-- `CARGO_HOME=$(pwd)/.cargo-home mix test --exclude external`: 47 tests, 0 failures, 2 external tests excluded.
+- `CARGO_HOME=$(pwd)/.cargo-home mix test --exclude external`: 51 tests, 0 failures, 2 external tests excluded.
 - `CARGO_HOME=$(pwd)/.cargo-home mix test --only external`: 2 tests, 0 failures.
 
 ## Slice 1 Review
@@ -85,16 +85,18 @@ Findings:
 - Completion submission is asynchronous and failure-bearing. The server handles `{:workflow_completion, :ok | {:error, reason}}` and `{:activity_completion, :ok | {:error, reason}}` messages as fatal backend submission failures when needed.
 - Activity heartbeats flow from `Temporalex.Activity.Context.heartbeat/2` through `Temporalex.Server.record_activity_heartbeat/3` to the backend, where details are encoded as ETF payload bytes and submitted through Temporal Core.
 - Worker shutdown is covered by explicit server termination, the Rustler resource monitor, and resource drop. Shutdown initiation is scheduled on the Temporal Core Tokio runtime handle rather than called directly from BEAM scheduler threads.
-- The minimal client path starts workflows and awaits workflow results through the Temporal Core connection kept in backend state.
-- `test/temporalex/integration/temporal_core_integration_test.exs` verifies a real Temporal dev-server run covering client start, worker polling, timer command/resolution, activity task execution, heartbeat submission, activity completion, workflow completion, and result decoding.
+- The client path starts workflows, awaits workflow results, signals, queries, updates, cancels, terminates, and describes executions through the Temporal Core connection kept in backend state.
+- Workflow start options cover task queue selection, headers, search attributes, workflow timeouts, retry policy, id reuse/conflict policies, and static metadata. Activity command encoding covers retry policy and activity cancellation type. Invalid negative duration/retry values are rejected instead of cast into oversized native durations.
+- `test/temporalex/integration/temporal_core_integration_test.exs` verifies a real Temporal dev-server run covering client start, invalid start option handling, worker polling, timer command/resolution, activity task execution, heartbeat submission, activity completion, workflow completion, signal/query/update/describe, termination, and result decoding.
 
 Outcome:
 
-- No native/backend boundary shortcut is known that blocks beta evaluation of workflow start/result, worker polling, timers, activities, heartbeats, completions, shutdown, and ETF payload conversion.
+- No native/backend boundary shortcut is known that blocks beta evaluation of workflow start/result, signal/query/update/describe/terminate, worker polling, timers, activities, heartbeats, completions, shutdown, workflow/activity option encoding, and ETF payload conversion.
 
 ## Beta Limits
 
 These are known beta limits, not review-gate blockers for the implemented native execution path:
 
-- Client APIs beyond workflow start/result are not implemented yet.
-- Patch/version APIs, deterministic random helpers, UUID helpers, child workflows, local activities, and Nexus operations are outside the implemented beta scope.
+- Full workflow cancellation propagation is not implemented yet. The client cancellation RPC is wired and `Job.CancelWorkflow` updates the workflow cancellation flag, but cancellation scopes and automatic unblocking/cancellation of pending timers, activities, phases, and branches need a dedicated design pass.
+- Public error structs are still planned. Client/native errors currently return stable tagged terms for common workflow states plus strings for lower-level transport failures.
+- Child workflows, local activities, and Nexus operations are outside the implemented beta scope.

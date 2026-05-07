@@ -134,6 +134,36 @@ shutdown_worker(worker, pid) :: :ok
 # sends {:shutdown_complete, :ok | {:error, reason}}
 ```
 
+Client operations:
+
+```elixir
+start_workflow(client, namespace, workflow_id, workflow_type, task_queue, input, opts, pid, ref) :: :ok
+# sends {:workflow_started, ref, {:ok, info} | {:error, reason}}
+
+get_workflow_result(client, namespace, workflow_id, run_id, pid, ref) :: :ok
+# sends {:workflow_result, ref, {:ok, result} | {:error, reason}}
+
+signal_workflow(client, namespace, workflow_id, run_id, signal_name, args, opts, pid, ref) :: :ok
+# sends {:workflow_signalled, ref, {:ok, :ok} | {:error, reason}}
+
+query_workflow(client, namespace, workflow_id, run_id, query_name, args, opts, pid, ref) :: :ok
+# sends {:workflow_queried, ref, {:ok, result} | {:error, reason}}
+
+update_workflow(client, namespace, workflow_id, run_id, update_name, args, opts, pid, ref) :: :ok
+# sends {:workflow_updated, ref, {:ok, result} | {:error, reason}}
+
+cancel_workflow(client, namespace, workflow_id, run_id, reason, request_id, pid, ref) :: :ok
+# sends {:workflow_cancelled, ref, {:ok, :ok} | {:error, reason}}
+
+terminate_workflow(client, namespace, workflow_id, run_id, reason, details, pid, ref) :: :ok
+# sends {:workflow_terminated, ref, {:ok, :ok} | {:error, reason}}
+
+describe_workflow(client, namespace, workflow_id, run_id, pid, ref) :: :ok
+# sends {:workflow_described, ref, {:ok, description} | {:error, reason}}
+```
+
+Immediate validation failures send through the NIF caller environment. Tokio tasks use `OwnedEnv::send_and_clear`; managed NIF threads must not.
+
 ## Payload Conversion
 
 The native backend uses ETF payloads:

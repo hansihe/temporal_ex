@@ -7,8 +7,12 @@ use rustler::{Decoder, Encoder, Resource, ResourceArc, Term};
 use std::collections::HashMap;
 use std::sync::Arc;
 use temporalio_client::{
-    Client, ClientOptions, Connection, ConnectionOptions, TlsOptions, UntypedWorkflow,
-    WorkflowExecutionInfo, WorkflowGetResultOptions, WorkflowHandle, WorkflowStartOptions,
+    Client, ClientOptions, Connection, ConnectionOptions, TlsOptions, UntypedQuery, UntypedSignal,
+    UntypedUpdate, UntypedWorkflow, WorkflowCancelOptions, WorkflowDescribeOptions,
+    WorkflowExecuteUpdateOptions, WorkflowExecutionDescription, WorkflowExecutionInfo,
+    WorkflowGetResultOptions, WorkflowHandle, WorkflowQueryOptions, WorkflowSignalOptions,
+    WorkflowStartOptions, WorkflowTerminateOptions,
+    errors::{WorkflowGetResultError, WorkflowQueryError, WorkflowStartError, WorkflowUpdateError},
 };
 use temporalio_common::data_converters::RawValue;
 use temporalio_common::protos::coresdk::activity_result::{
@@ -21,7 +25,7 @@ use temporalio_common::protos::coresdk::workflow_activation::{
     workflow_activation_job,
 };
 use temporalio_common::protos::coresdk::workflow_commands::{
-    CancelTimer, CancelWorkflowExecution, CompleteWorkflowExecution,
+    ActivityCancellationType, CancelTimer, CancelWorkflowExecution, CompleteWorkflowExecution,
     ContinueAsNewWorkflowExecution, FailWorkflowExecution, QueryResult, QuerySuccess,
     ScheduleActivity, SetPatchMarker, StartTimer, UpdateResponse, UpsertWorkflowSearchAttributes,
     WorkflowCommand, query_result, update_response, workflow_command,
@@ -31,9 +35,12 @@ use temporalio_common::protos::coresdk::workflow_completion::{
     WorkflowActivationCompletion, workflow_activation_completion,
 };
 use temporalio_common::protos::coresdk::{ActivityHeartbeat, ActivityTaskCompletion};
-use temporalio_common::protos::temporal::api::common::v1::{Payload, Payloads, SearchAttributes};
+use temporalio_common::protos::temporal::api::common::v1::{
+    Header, Payload, Payloads, RetryPolicy, SearchAttributes,
+};
 use temporalio_common::protos::temporal::api::enums::v1::{
-    VersioningBehavior, WorkflowTaskFailedCause,
+    VersioningBehavior, WorkflowExecutionStatus, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+    WorkflowTaskFailedCause,
 };
 use temporalio_common::protos::temporal::api::failure::v1::{
     ApplicationFailureInfo, CanceledFailureInfo, Failure, failure,
@@ -139,6 +146,59 @@ rustler::atoms! {
     opts_atom = "opts",
     response,
     deprecated,
+    signal,
+    query,
+    update,
+    workflow_signalled,
+    workflow_queried,
+    workflow_updated,
+    workflow_cancelled,
+    workflow_terminated,
+    workflow_described,
+    terminated,
+    timed_out,
+    continued_as_new,
+    running,
+    paused,
+    already_started,
+    not_found,
+    execution_timeout,
+    workflow_execution_timeout,
+    run_timeout,
+    workflow_run_timeout,
+    task_timeout,
+    workflow_task_timeout,
+    cron_schedule,
+    search_attributes,
+    retry_policy,
+    id_reuse_policy,
+    workflow_id_reuse_policy,
+    id_conflict_policy,
+    workflow_id_conflict_policy,
+    request_id,
+    update_id,
+    initial_interval,
+    maximum_interval,
+    maximum_attempts,
+    backoff_coefficient,
+    non_retryable_error_types,
+    cancellation_type,
+    try_cancel,
+    wait_cancellation_completed,
+    abandon,
+    allow_duplicate,
+    allow_duplicate_failed_only,
+    reject_duplicate,
+    terminate_if_running,
+    fail,
+    use_existing,
+    terminate_existing,
+    static_summary,
+    static_details,
+    start_time_ms,
+    execution_time_ms,
+    close_time_ms,
+    history_length_atom = "history_length",
     calendar_atom = "calendar",
     year_atom = "year",
     month_atom = "month",
@@ -305,6 +365,15 @@ fn binary_term<'a>(env: Env<'a>, bytes: &[u8]) -> Term<'a> {
 
 fn error_term<'a>(env: Env<'a>, reason: impl Into<String>) -> Term<'a> {
     (error(), reason.into()).encode(env)
+}
+
+fn string_term<'a>(env: Env<'a>, value: impl Into<String>) -> Term<'a> {
+    let value = value.into();
+    rustler::Encoder::encode(&value, env)
+}
+
+fn i64_term<'a>(env: Env<'a>, value: i64) -> Term<'a> {
+    rustler::Encoder::encode(&value, env)
 }
 
 fn nif_error(err: rustler::Error) -> anyhow::Error {
@@ -595,17 +664,26 @@ fn shutdown_worker(worker: ResourceArc<WorkerResource>, pid: LocalPid) -> Atom {
 }
 
 #[rustler::nif]
-fn start_workflow(
+fn start_workflow<'a>(
+    env: Env<'a>,
     client: ResourceArc<ClientResource>,
     namespace: String,
     workflow_id: String,
     workflow_type: String,
     task_queue: String,
-    input: Term,
+    input: Term<'a>,
+    opts: Term<'a>,
     pid: LocalPid,
-    reference: Term,
+    reference: Term<'a>,
 ) -> Atom {
     let input_payload = payload_from_term(input);
+    let start_options = match workflow_start_options(task_queue, workflow_id.clone(), opts) {
+        Ok(options) => options,
+        Err(err) => {
+            send_immediate_ref_error(env, reference, &pid, workflow_started(), format!("{err:#}"));
+            return ok();
+        }
+    };
     let connection = client.connection.clone();
     let handle = client._runtime_handle.clone();
     let saved_env = OwnedEnv::new();
@@ -613,14 +691,15 @@ fn start_workflow(
 
     handle.spawn(async move {
         let result = async {
-            let client = Client::new(connection, ClientOptions::new(namespace.clone()).build())?;
+            let client = Client::new(connection, ClientOptions::new(namespace.clone()).build())
+                .map_err(|err| StartWorkflowResult::Other(format!("{err:#}")))?;
             let workflow = UntypedWorkflow::new(workflow_type.clone());
-            let options = WorkflowStartOptions::new(task_queue, workflow_id.clone()).build();
             let handle = client
-                .start_workflow(workflow, RawValue::new(vec![input_payload]), options)
-                .await?;
+                .start_workflow(workflow, RawValue::new(vec![input_payload]), start_options)
+                .await
+                .map_err(StartWorkflowResult::Start)?;
             let run_id = handle.info().run_id.clone().unwrap_or_default();
-            Ok::<_, anyhow::Error>((workflow_id, workflow_type, run_id))
+            Ok::<_, StartWorkflowResult>((workflow_id, workflow_type, run_id))
         }
         .await;
 
@@ -640,7 +719,7 @@ fn start_workflow(
                         .unwrap();
                     (ok(), map).encode(env)
                 }
-                Err(err) => (error(), format!("{err:#}")).encode(env),
+                Err(err) => (error(), workflow_start_error_to_term(env, err)).encode(env),
             },
         );
     });
@@ -664,18 +743,13 @@ fn get_workflow_result(
 
     handle.spawn(async move {
         let result = async {
-            let client = Client::new(connection, ClientOptions::new(namespace.clone()).build())?;
-            let wf = WorkflowHandle::<Client, UntypedWorkflow>::new(
-                client,
-                WorkflowExecutionInfo {
-                    namespace,
-                    workflow_id,
-                    run_id: run_id.clone(),
-                    first_execution_run_id: run_id,
-                },
-            );
-            let raw = wf.get_result(WorkflowGetResultOptions::default()).await?;
-            Ok::<_, anyhow::Error>(raw.payloads)
+            let wf = untyped_handle(connection, namespace, workflow_id, run_id)
+                .map_err(GetWorkflowResult::Other)?;
+            let raw = wf
+                .get_result(WorkflowGetResultOptions::default())
+                .await
+                .map_err(GetWorkflowResult::Get)?;
+            Ok::<_, GetWorkflowResult>(raw.payloads)
         }
         .await;
 
@@ -691,6 +765,335 @@ fn get_workflow_result(
                         Err(err) => (error(), format!("{err:#}")).encode(env),
                     },
                     None => (ok(), nil()).encode(env),
+                },
+                Err(err) => (error(), get_workflow_result_error_to_term(env, err)).encode(env),
+            },
+        );
+    });
+
+    ok()
+}
+
+#[rustler::nif]
+fn signal_workflow<'a>(
+    env: Env<'a>,
+    client: ResourceArc<ClientResource>,
+    namespace: String,
+    workflow_id: String,
+    run_id: Option<String>,
+    signal_name: String,
+    args_term: Term<'a>,
+    opts: Term<'a>,
+    pid: LocalPid,
+    reference: Term<'a>,
+) -> Atom {
+    let payloads = match terms_list_to_payloads(args_term) {
+        Ok(payloads) => payloads,
+        Err(err) => {
+            send_immediate_ref_error(
+                env,
+                reference,
+                &pid,
+                workflow_signalled(),
+                format!("{err:#}"),
+            );
+            return ok();
+        }
+    };
+    let options = match signal_options(opts) {
+        Ok(options) => options,
+        Err(err) => {
+            send_immediate_ref_error(
+                env,
+                reference,
+                &pid,
+                workflow_signalled(),
+                format!("{err:#}"),
+            );
+            return ok();
+        }
+    };
+    let connection = client.connection.clone();
+    let handle = client._runtime_handle.clone();
+    let saved_env = OwnedEnv::new();
+    let saved_ref = saved_env.save(reference);
+
+    handle.spawn(async move {
+        let result = async {
+            let wf = untyped_handle(connection, namespace, workflow_id, run_id)?;
+            wf.signal(
+                UntypedSignal::<UntypedWorkflow>::new(signal_name),
+                RawValue::new(payloads),
+                options,
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+
+        send_ref_result(
+            saved_env,
+            saved_ref,
+            &pid,
+            workflow_signalled(),
+            |env| match result {
+                Ok(()) => (ok(), ok()).encode(env),
+                Err(err) => (error(), format!("{err:#}")).encode(env),
+            },
+        );
+    });
+
+    ok()
+}
+
+#[rustler::nif]
+fn query_workflow<'a>(
+    env: Env<'a>,
+    client: ResourceArc<ClientResource>,
+    namespace: String,
+    workflow_id: String,
+    run_id: Option<String>,
+    query_name: String,
+    args_term: Term<'a>,
+    opts: Term<'a>,
+    pid: LocalPid,
+    reference: Term<'a>,
+) -> Atom {
+    let payloads = match terms_list_to_payloads(args_term) {
+        Ok(payloads) => payloads,
+        Err(err) => {
+            send_immediate_ref_error(env, reference, &pid, workflow_queried(), format!("{err:#}"));
+            return ok();
+        }
+    };
+    let options = match query_options(opts) {
+        Ok(options) => options,
+        Err(err) => {
+            send_immediate_ref_error(env, reference, &pid, workflow_queried(), format!("{err:#}"));
+            return ok();
+        }
+    };
+    let connection = client.connection.clone();
+    let handle = client._runtime_handle.clone();
+    let saved_env = OwnedEnv::new();
+    let saved_ref = saved_env.save(reference);
+
+    handle.spawn(async move {
+        let result = async {
+            let wf = untyped_handle(connection, namespace, workflow_id, run_id)
+                .map_err(QueryWorkflowResult::Other)?;
+            let raw = wf
+                .query(
+                    UntypedQuery::<UntypedWorkflow>::new(query_name),
+                    RawValue::new(payloads),
+                    options,
+                )
+                .await
+                .map_err(QueryWorkflowResult::Query)?;
+            Ok::<_, QueryWorkflowResult>(raw.payloads)
+        }
+        .await;
+
+        send_ref_result(
+            saved_env,
+            saved_ref,
+            &pid,
+            workflow_queried(),
+            |env| match result {
+                Ok(payloads) => payload_result_to_term(env, payloads),
+                Err(err) => (error(), query_workflow_error_to_term(env, err)).encode(env),
+            },
+        );
+    });
+
+    ok()
+}
+
+#[rustler::nif]
+fn update_workflow<'a>(
+    env: Env<'a>,
+    client: ResourceArc<ClientResource>,
+    namespace: String,
+    workflow_id: String,
+    run_id: Option<String>,
+    update_name: String,
+    args_term: Term<'a>,
+    opts: Term<'a>,
+    pid: LocalPid,
+    reference: Term<'a>,
+) -> Atom {
+    let payloads = match terms_list_to_payloads(args_term) {
+        Ok(payloads) => payloads,
+        Err(err) => {
+            send_immediate_ref_error(env, reference, &pid, workflow_updated(), format!("{err:#}"));
+            return ok();
+        }
+    };
+    let options = match update_options(opts) {
+        Ok(options) => options,
+        Err(err) => {
+            send_immediate_ref_error(env, reference, &pid, workflow_updated(), format!("{err:#}"));
+            return ok();
+        }
+    };
+    let connection = client.connection.clone();
+    let handle = client._runtime_handle.clone();
+    let saved_env = OwnedEnv::new();
+    let saved_ref = saved_env.save(reference);
+
+    handle.spawn(async move {
+        let result = async {
+            let wf = untyped_handle(connection, namespace, workflow_id, run_id)
+                .map_err(UpdateWorkflowResult::Other)?;
+            let raw = wf
+                .execute_update(
+                    UntypedUpdate::<UntypedWorkflow>::new(update_name),
+                    RawValue::new(payloads),
+                    options,
+                )
+                .await
+                .map_err(UpdateWorkflowResult::Update)?;
+            Ok::<_, UpdateWorkflowResult>(raw.payloads)
+        }
+        .await;
+
+        send_ref_result(
+            saved_env,
+            saved_ref,
+            &pid,
+            workflow_updated(),
+            |env| match result {
+                Ok(payloads) => payload_result_to_term(env, payloads),
+                Err(err) => (error(), update_workflow_error_to_term(env, err)).encode(env),
+            },
+        );
+    });
+
+    ok()
+}
+
+#[rustler::nif]
+fn cancel_workflow(
+    client: ResourceArc<ClientResource>,
+    namespace: String,
+    workflow_id: String,
+    run_id: Option<String>,
+    reason_text: String,
+    request_id_text: Option<String>,
+    pid: LocalPid,
+    reference: Term,
+) -> Atom {
+    let connection = client.connection.clone();
+    let handle = client._runtime_handle.clone();
+    let saved_env = OwnedEnv::new();
+    let saved_ref = saved_env.save(reference);
+
+    handle.spawn(async move {
+        let result = async {
+            let wf = untyped_handle(connection, namespace, workflow_id, run_id)?;
+            let mut options = WorkflowCancelOptions::default();
+            options.reason = reason_text;
+            options.request_id = request_id_text;
+            wf.cancel(options).await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+
+        send_ref_result(
+            saved_env,
+            saved_ref,
+            &pid,
+            workflow_cancelled(),
+            |env| match result {
+                Ok(()) => (ok(), ok()).encode(env),
+                Err(err) => (error(), format!("{err:#}")).encode(env),
+            },
+        );
+    });
+
+    ok()
+}
+
+#[rustler::nif]
+fn terminate_workflow(
+    client: ResourceArc<ClientResource>,
+    namespace: String,
+    workflow_id: String,
+    run_id: Option<String>,
+    reason_text: String,
+    details_term: Term,
+    pid: LocalPid,
+    reference: Term,
+) -> Atom {
+    let details = if details_term.decode::<Atom>().ok() == Some(nil()) {
+        None
+    } else {
+        Some(Payloads {
+            payloads: vec![payload_from_term(details_term)],
+        })
+    };
+    let connection = client.connection.clone();
+    let handle = client._runtime_handle.clone();
+    let saved_env = OwnedEnv::new();
+    let saved_ref = saved_env.save(reference);
+
+    handle.spawn(async move {
+        let result = async {
+            let wf = untyped_handle(connection, namespace, workflow_id, run_id)?;
+            let mut options = WorkflowTerminateOptions::default();
+            options.reason = reason_text;
+            options.details = details;
+            wf.terminate(options).await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+
+        send_ref_result(
+            saved_env,
+            saved_ref,
+            &pid,
+            workflow_terminated(),
+            |env| match result {
+                Ok(()) => (ok(), ok()).encode(env),
+                Err(err) => (error(), format!("{err:#}")).encode(env),
+            },
+        );
+    });
+
+    ok()
+}
+
+#[rustler::nif]
+fn describe_workflow(
+    client: ResourceArc<ClientResource>,
+    namespace: String,
+    workflow_id: String,
+    run_id: Option<String>,
+    pid: LocalPid,
+    reference: Term,
+) -> Atom {
+    let connection = client.connection.clone();
+    let handle = client._runtime_handle.clone();
+    let saved_env = OwnedEnv::new();
+    let saved_ref = saved_env.save(reference);
+
+    handle.spawn(async move {
+        let result = async {
+            let wf = untyped_handle(connection, namespace, workflow_id, run_id)?;
+            let description = wf.describe(WorkflowDescribeOptions::default()).await?;
+            Ok::<_, anyhow::Error>(description)
+        }
+        .await;
+
+        send_ref_result(
+            saved_env,
+            saved_ref,
+            &pid,
+            workflow_described(),
+            |env| match result {
+                Ok(description) => match workflow_description_to_term(env, &description) {
+                    Ok(term) => (ok(), term).encode(env),
+                    Err(err) => (error(), format!("{err:#}")).encode(env),
                 },
                 Err(err) => (error(), format!("{err:#}")).encode(env),
             },
@@ -808,6 +1211,179 @@ fn send_ref_result<F>(
         let reference = saved_ref.load(env);
         (tag, reference, build_result(env)).encode(env)
     });
+}
+
+fn send_immediate_ref_error<'a>(
+    env: Env<'a>,
+    reference: Term<'a>,
+    pid: &LocalPid,
+    tag: Atom,
+    reason: String,
+) {
+    let _ = env.send(pid, (tag, reference, (error(), reason)));
+}
+
+enum StartWorkflowResult {
+    Start(WorkflowStartError),
+    Other(String),
+}
+
+enum GetWorkflowResult {
+    Get(WorkflowGetResultError),
+    Other(anyhow::Error),
+}
+
+enum QueryWorkflowResult {
+    Query(WorkflowQueryError),
+    Other(anyhow::Error),
+}
+
+enum UpdateWorkflowResult {
+    Update(WorkflowUpdateError),
+    Other(anyhow::Error),
+}
+
+fn untyped_handle(
+    connection: Connection,
+    namespace: String,
+    workflow_id: String,
+    run_id: Option<String>,
+) -> anyhow::Result<WorkflowHandle<Client, UntypedWorkflow>> {
+    let client = Client::new(connection, ClientOptions::new(namespace.clone()).build())?;
+    Ok(WorkflowHandle::<Client, UntypedWorkflow>::new(
+        client,
+        WorkflowExecutionInfo {
+            namespace,
+            workflow_id,
+            run_id: run_id.clone(),
+            first_execution_run_id: run_id,
+        },
+    ))
+}
+
+fn payload_result_to_term<'a>(env: Env<'a>, payloads: Vec<Payload>) -> Term<'a> {
+    match payloads.into_iter().next() {
+        Some(payload) => match payload_to_term(env, &payload) {
+            Ok(term) => (ok(), term).encode(env),
+            Err(err) => (error(), format!("{err:#}")).encode(env),
+        },
+        None => (ok(), nil()).encode(env),
+    }
+}
+
+fn workflow_start_error_to_term<'a>(env: Env<'a>, err: StartWorkflowResult) -> Term<'a> {
+    match err {
+        StartWorkflowResult::Start(WorkflowStartError::AlreadyStarted { run_id, .. }) => {
+            let run_id_term = run_id
+                .map(|id| string_term(env, id))
+                .unwrap_or_else(|| nil().encode(env));
+            (already_started(), run_id_term).encode(env)
+        }
+        StartWorkflowResult::Start(err) => string_term(env, format!("{err:#}")),
+        StartWorkflowResult::Other(reason) => string_term(env, reason),
+    }
+}
+
+fn get_workflow_result_error_to_term<'a>(env: Env<'a>, err: GetWorkflowResult) -> Term<'a> {
+    match err {
+        GetWorkflowResult::Get(WorkflowGetResultError::Failed(failure)) => {
+            match failure_to_term(env, Some(failure.as_ref())) {
+                Ok(term) => (failed(), term).encode(env),
+                Err(err) => string_term(env, format!("{err:#}")),
+            }
+        }
+        GetWorkflowResult::Get(WorkflowGetResultError::Cancelled { details }) => {
+            match payloads_to_terms(env, &details) {
+                Ok(terms) => (cancelled(), terms).encode(env),
+                Err(err) => string_term(env, format!("{err:#}")),
+            }
+        }
+        GetWorkflowResult::Get(WorkflowGetResultError::Terminated { details }) => {
+            match payloads_to_terms(env, &details) {
+                Ok(terms) => (terminated(), terms).encode(env),
+                Err(err) => string_term(env, format!("{err:#}")),
+            }
+        }
+        GetWorkflowResult::Get(WorkflowGetResultError::TimedOut) => timed_out().encode(env),
+        GetWorkflowResult::Get(WorkflowGetResultError::ContinuedAsNew) => {
+            continued_as_new().encode(env)
+        }
+        GetWorkflowResult::Get(WorkflowGetResultError::NotFound(_)) => not_found().encode(env),
+        GetWorkflowResult::Get(err) => string_term(env, format!("{err:#}")),
+        GetWorkflowResult::Other(err) => string_term(env, format!("{err:#}")),
+    }
+}
+
+fn query_workflow_error_to_term<'a>(env: Env<'a>, err: QueryWorkflowResult) -> Term<'a> {
+    match err {
+        QueryWorkflowResult::Query(WorkflowQueryError::Rejected(query_rejected)) => {
+            let status = WorkflowExecutionStatus::try_from(query_rejected.status)
+                .unwrap_or(WorkflowExecutionStatus::Unspecified);
+            (rejected(), workflow_status_atom(status)).encode(env)
+        }
+        QueryWorkflowResult::Query(WorkflowQueryError::NotFound(_)) => not_found().encode(env),
+        QueryWorkflowResult::Query(err) => string_term(env, format!("{err:#}")),
+        QueryWorkflowResult::Other(err) => string_term(env, format!("{err:#}")),
+    }
+}
+
+fn update_workflow_error_to_term<'a>(env: Env<'a>, err: UpdateWorkflowResult) -> Term<'a> {
+    match err {
+        UpdateWorkflowResult::Update(WorkflowUpdateError::Failed(failure)) => {
+            match failure_to_term(env, Some(failure.as_ref())) {
+                Ok(term) => (failed(), term).encode(env),
+                Err(err) => string_term(env, format!("{err:#}")),
+            }
+        }
+        UpdateWorkflowResult::Update(WorkflowUpdateError::NotFound(_)) => not_found().encode(env),
+        UpdateWorkflowResult::Update(err) => string_term(env, format!("{err:#}")),
+        UpdateWorkflowResult::Other(err) => string_term(env, format!("{err:#}")),
+    }
+}
+
+fn workflow_description_to_term<'a>(
+    env: Env<'a>,
+    description: &WorkflowExecutionDescription,
+) -> anyhow::Result<Term<'a>> {
+    put_fields!(
+        Term::map_new(env),
+        workflow_id() => description.id().to_string(),
+        run_id() => description.run_id().to_string(),
+        workflow_type() => description.workflow_type().to_string(),
+        status_atom() => workflow_status_atom(description.status()),
+        task_queue() => description.task_queue().to_string(),
+        history_length() => description.history_length() as i64,
+        start_time_ms() => option_i64_term(env, description.start_time().and_then(system_time_to_millis)),
+        execution_time_ms() => option_i64_term(env, description.execution_time().and_then(system_time_to_millis)),
+        close_time_ms() => option_i64_term(env, description.close_time().and_then(system_time_to_millis)),
+    )
+}
+
+fn option_i64_term<'a>(env: Env<'a>, value: Option<i64>) -> Term<'a> {
+    match value {
+        Some(value) => i64_term(env, value),
+        None => nil().encode(env),
+    }
+}
+
+fn system_time_to_millis(time: std::time::SystemTime) -> Option<i64> {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as i64)
+}
+
+fn workflow_status_atom(status: WorkflowExecutionStatus) -> Atom {
+    match status {
+        WorkflowExecutionStatus::Running => running(),
+        WorkflowExecutionStatus::Completed => completed(),
+        WorkflowExecutionStatus::Failed => failed(),
+        WorkflowExecutionStatus::Canceled => cancelled(),
+        WorkflowExecutionStatus::Terminated => terminated(),
+        WorkflowExecutionStatus::ContinuedAsNew => continued_as_new(),
+        WorkflowExecutionStatus::TimedOut => timed_out(),
+        WorkflowExecutionStatus::Paused => paused(),
+        WorkflowExecutionStatus::Unspecified => unspecified(),
+    }
 }
 
 fn payload_from_bytes(data: Vec<u8>) -> Payload {
@@ -1122,11 +1698,11 @@ fn command_from_term(command: Term, default_task_queue: &str) -> anyhow::Result<
         .map_err(nif_error)?;
     let variant = match module.as_str() {
         "Elixir.Temporalex.Core.Command.StartTimer" => {
+            let duration_ms = map_get_non_negative_i64(command, duration_ms(), "timer duration")?;
+
             workflow_command::Variant::StartTimer(StartTimer {
                 seq: map_get_i64(command, seq())? as u32,
-                start_to_fire_timeout: Some(duration_from_ms(
-                    map_get_i64(command, duration_ms())? as u64
-                )),
+                start_to_fire_timeout: Some(duration_from_ms(duration_ms)),
             })
         }
         "Elixir.Temporalex.Core.Command.CancelTimer" => {
@@ -1138,9 +1714,13 @@ fn command_from_term(command: Term, default_task_queue: &str) -> anyhow::Result<
             let opts = map_get(command, opts_atom())?;
             let task_queue = keyword_get_string(opts, task_queue())?
                 .unwrap_or_else(|| default_task_queue.to_string());
-            let timeout_ms = keyword_get_i64(opts, timeout())?
-                .or(keyword_get_i64(opts, start_to_close_timeout())?)
-                .unwrap_or(DEFAULT_ACTIVITY_TIMEOUT_MS as i64) as u64;
+            let timeout_ms = keyword_get_millis(opts, timeout(), "activity timeout")?
+                .or(keyword_get_millis(
+                    opts,
+                    start_to_close_timeout(),
+                    "activity start_to_close_timeout",
+                )?)
+                .unwrap_or(DEFAULT_ACTIVITY_TIMEOUT_MS);
 
             workflow_command::Variant::ScheduleActivity(ScheduleActivity {
                 seq: map_get_i64(command, seq())? as u32,
@@ -1150,15 +1730,28 @@ fn command_from_term(command: Term, default_task_queue: &str) -> anyhow::Result<
                 headers: keyword_get_payload_map(opts, headers())?,
                 arguments: terms_list_to_payloads(map_get(command, input())?)?,
                 schedule_to_close_timeout: Some(duration_from_ms(
-                    keyword_get_i64(opts, schedule_to_close_timeout())?.unwrap_or(timeout_ms as i64)
-                        as u64,
+                    keyword_get_millis(
+                        opts,
+                        schedule_to_close_timeout(),
+                        "activity schedule_to_close_timeout",
+                    )?
+                    .unwrap_or(timeout_ms),
                 )),
-                schedule_to_start_timeout: keyword_get_i64(opts, schedule_to_start_timeout())?
-                    .map(|ms| duration_from_ms(ms as u64)),
+                schedule_to_start_timeout: keyword_get_millis(
+                    opts,
+                    schedule_to_start_timeout(),
+                    "activity schedule_to_start_timeout",
+                )?
+                .map(duration_from_ms),
                 start_to_close_timeout: Some(duration_from_ms(timeout_ms)),
-                heartbeat_timeout: keyword_get_i64(opts, heartbeat_timeout())?
-                    .map(|ms| duration_from_ms(ms as u64)),
-                cancellation_type: 1,
+                heartbeat_timeout: keyword_get_millis(
+                    opts,
+                    heartbeat_timeout(),
+                    "activity heartbeat_timeout",
+                )?
+                .map(duration_from_ms),
+                retry_policy: retry_policy_from_opts(opts)?,
+                cancellation_type: activity_cancellation_type_from_opts(opts)? as i32,
                 do_not_eagerly_execute: false,
                 ..Default::default()
             })
@@ -1401,11 +1994,60 @@ fn terms_list_to_payloads(list: Term) -> anyhow::Result<Vec<Payload>> {
 }
 
 fn keyword_get_i64(opts: Term, key: Atom) -> anyhow::Result<Option<i64>> {
-    keyword_get(opts, key).map(|term| term.and_then(|term| term.decode().ok()))
+    let Some(term) = keyword_get(opts, key)? else {
+        return Ok(None);
+    };
+
+    if term.decode::<Atom>().ok() == Some(nil()) {
+        Ok(None)
+    } else {
+        decode_term(term).map(Some)
+    }
+}
+
+fn keyword_get_millis(opts: Term, key: Atom, option_name: &str) -> anyhow::Result<Option<u64>> {
+    keyword_get_i64(opts, key)?
+        .map(|ms| non_negative_millis(ms, option_name))
+        .transpose()
+}
+
+fn keyword_get_f64(opts: Term, key: Atom) -> anyhow::Result<Option<f64>> {
+    let Some(term) = keyword_get(opts, key)? else {
+        return Ok(None);
+    };
+
+    if term.decode::<Atom>().ok() == Some(nil()) {
+        return Ok(None);
+    }
+
+    if let Ok(value) = term.decode::<f64>() {
+        Ok(Some(value))
+    } else {
+        decode_term::<i64>(term).map(|value| Some(value as f64))
+    }
 }
 
 fn keyword_get_string(opts: Term, key: Atom) -> anyhow::Result<Option<String>> {
-    keyword_get(opts, key).map(|term| term.and_then(|term| term.decode().ok()))
+    let Some(term) = keyword_get(opts, key)? else {
+        return Ok(None);
+    };
+
+    if term.decode::<Atom>().ok() == Some(nil()) {
+        Ok(None)
+    } else {
+        decode_term(term).map(Some)
+    }
+}
+
+fn keyword_get_string_list(opts: Term, key: Atom) -> anyhow::Result<Option<Vec<String>>> {
+    let Some(term) = keyword_get(opts, key)? else {
+        return Ok(None);
+    };
+
+    let iter: ListIterator = decode_term(term)?;
+    iter.map(decode_term::<String>)
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(Some)
 }
 
 fn keyword_get_payload_map(opts: Term, key: Atom) -> anyhow::Result<HashMap<String, Payload>> {
@@ -1425,6 +2067,210 @@ fn term_to_payload_map(term: Term) -> anyhow::Result<HashMap<String, Payload>> {
     }
 
     Ok(headers)
+}
+
+fn workflow_start_options(
+    task_queue: String,
+    workflow_id: String,
+    opts: Term,
+) -> anyhow::Result<WorkflowStartOptions> {
+    let mut options = WorkflowStartOptions::new(task_queue, workflow_id).build();
+    options.id_reuse_policy = workflow_id_reuse_policy_from_opts(opts)?;
+    options.id_conflict_policy = workflow_id_conflict_policy_from_opts(opts)?;
+    options.execution_timeout =
+        duration_option_from_opts(opts, &[execution_timeout(), workflow_execution_timeout()])?;
+    options.run_timeout =
+        duration_option_from_opts(opts, &[run_timeout(), workflow_run_timeout()])?;
+    options.task_timeout =
+        duration_option_from_opts(opts, &[task_timeout(), workflow_task_timeout()])?;
+    options.cron_schedule = keyword_get_string(opts, cron_schedule())?;
+    options.search_attributes = payload_map_option_from_opts(opts, search_attributes())?;
+    options.retry_policy = retry_policy_from_opts(opts)?;
+    options.header = header_from_opts(opts)?;
+    options.static_summary = keyword_get_string(opts, static_summary())?;
+    options.static_details = keyword_get_string(opts, static_details())?;
+    Ok(options)
+}
+
+fn signal_options(opts: Term) -> anyhow::Result<WorkflowSignalOptions> {
+    let mut options = WorkflowSignalOptions::default();
+    options.request_id = keyword_get_string(opts, request_id())?;
+    options.header = header_from_opts(opts)?;
+    Ok(options)
+}
+
+fn query_options(opts: Term) -> anyhow::Result<WorkflowQueryOptions> {
+    let mut options = WorkflowQueryOptions::default();
+    options.header = header_from_opts(opts)?;
+    Ok(options)
+}
+
+fn update_options(opts: Term) -> anyhow::Result<WorkflowExecuteUpdateOptions> {
+    let mut options = WorkflowExecuteUpdateOptions::default();
+    options.update_id = keyword_get_string(opts, update_id())?;
+    options.header = header_from_opts(opts)?;
+    Ok(options)
+}
+
+fn header_from_opts(opts: Term) -> anyhow::Result<Option<Header>> {
+    let fields = keyword_get_payload_map(opts, headers())?;
+    if fields.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(Header { fields }))
+    }
+}
+
+fn payload_map_option_from_opts(
+    opts: Term,
+    key: Atom,
+) -> anyhow::Result<Option<HashMap<String, Payload>>> {
+    let Some(term) = keyword_get(opts, key)? else {
+        return Ok(None);
+    };
+
+    if term.decode::<Atom>().ok() == Some(nil()) {
+        Ok(None)
+    } else {
+        Ok(Some(term_to_payload_map(term)?))
+    }
+}
+
+fn retry_policy_from_opts(opts: Term) -> anyhow::Result<Option<RetryPolicy>> {
+    let Some(term) = keyword_get(opts, retry_policy())? else {
+        return Ok(None);
+    };
+
+    if term.decode::<Atom>().ok() == Some(nil()) {
+        Ok(None)
+    } else {
+        Ok(Some(retry_policy_from_term(term)?))
+    }
+}
+
+fn retry_policy_from_term(term: Term) -> anyhow::Result<RetryPolicy> {
+    let backoff_coefficient = keyword_get_f64(term, backoff_coefficient())?.unwrap_or(0.0);
+    if backoff_coefficient < 0.0 {
+        return Err(anyhow!(
+            "retry_policy.backoff_coefficient must be non-negative"
+        ));
+    }
+
+    let maximum_attempts = keyword_get_i64(term, maximum_attempts())?.unwrap_or(0);
+    if maximum_attempts < 0 || maximum_attempts > i32::MAX as i64 {
+        return Err(anyhow!(
+            "retry_policy.maximum_attempts must fit in a non-negative i32"
+        ));
+    }
+
+    Ok(RetryPolicy {
+        initial_interval: keyword_get_millis(
+            term,
+            initial_interval(),
+            "retry_policy.initial_interval",
+        )?
+        .map(duration_from_ms),
+        backoff_coefficient,
+        maximum_interval: keyword_get_millis(
+            term,
+            maximum_interval(),
+            "retry_policy.maximum_interval",
+        )?
+        .map(duration_from_ms),
+        maximum_attempts: maximum_attempts as i32,
+        non_retryable_error_types: keyword_get_string_list(term, non_retryable_error_types())?
+            .unwrap_or_default(),
+    })
+}
+
+fn activity_cancellation_type_from_opts(opts: Term) -> anyhow::Result<ActivityCancellationType> {
+    let Some(term) = keyword_get(opts, cancellation_type())? else {
+        return Ok(ActivityCancellationType::WaitCancellationCompleted);
+    };
+
+    let atom: Atom = decode_term(term)?;
+    if atom == try_cancel() {
+        Ok(ActivityCancellationType::TryCancel)
+    } else if atom == wait_cancellation_completed() {
+        Ok(ActivityCancellationType::WaitCancellationCompleted)
+    } else if atom == abandon() {
+        Ok(ActivityCancellationType::Abandon)
+    } else {
+        Err(anyhow!("unsupported activity cancellation type"))
+    }
+}
+
+#[allow(deprecated)]
+fn workflow_id_reuse_policy_from_opts(opts: Term) -> anyhow::Result<WorkflowIdReusePolicy> {
+    let Some(term) =
+        keyword_get(opts, workflow_id_reuse_policy())?.or(keyword_get(opts, id_reuse_policy())?)
+    else {
+        return Ok(WorkflowIdReusePolicy::Unspecified);
+    };
+
+    let atom: Atom = decode_term(term)?;
+    if atom == allow_duplicate() {
+        Ok(WorkflowIdReusePolicy::AllowDuplicate)
+    } else if atom == allow_duplicate_failed_only() {
+        Ok(WorkflowIdReusePolicy::AllowDuplicateFailedOnly)
+    } else if atom == reject_duplicate() {
+        Ok(WorkflowIdReusePolicy::RejectDuplicate)
+    } else if atom == terminate_if_running() {
+        Ok(WorkflowIdReusePolicy::TerminateIfRunning)
+    } else if atom == unspecified() {
+        Ok(WorkflowIdReusePolicy::Unspecified)
+    } else {
+        Err(anyhow!("unsupported workflow id reuse policy"))
+    }
+}
+
+fn workflow_id_conflict_policy_from_opts(opts: Term) -> anyhow::Result<WorkflowIdConflictPolicy> {
+    let Some(term) = keyword_get(opts, workflow_id_conflict_policy())?
+        .or(keyword_get(opts, id_conflict_policy())?)
+    else {
+        return Ok(WorkflowIdConflictPolicy::Unspecified);
+    };
+
+    let atom: Atom = decode_term(term)?;
+    if atom == fail() {
+        Ok(WorkflowIdConflictPolicy::Fail)
+    } else if atom == use_existing() {
+        Ok(WorkflowIdConflictPolicy::UseExisting)
+    } else if atom == terminate_existing() {
+        Ok(WorkflowIdConflictPolicy::TerminateExisting)
+    } else if atom == unspecified() {
+        Ok(WorkflowIdConflictPolicy::Unspecified)
+    } else {
+        Err(anyhow!("unsupported workflow id conflict policy"))
+    }
+}
+
+fn duration_option_from_opts(
+    opts: Term,
+    keys: &[Atom],
+) -> anyhow::Result<Option<std::time::Duration>> {
+    for key in keys {
+        if let Some(ms) = keyword_get_i64(opts, *key)? {
+            if ms < 0 {
+                return Err(anyhow!("duration option must be non-negative"));
+            }
+            return Ok(Some(std::time::Duration::from_millis(ms as u64)));
+        }
+    }
+
+    Ok(None)
+}
+
+fn map_get_non_negative_i64(map: Term, key: Atom, field_name: &str) -> anyhow::Result<u64> {
+    non_negative_millis(map_get_i64(map, key)?, field_name)
+}
+
+fn non_negative_millis(ms: i64, option_name: &str) -> anyhow::Result<u64> {
+    if ms < 0 {
+        Err(anyhow!("{option_name} must be non-negative"))
+    } else {
+        Ok(ms as u64)
+    }
 }
 
 fn keyword_get(opts: Term, key: Atom) -> anyhow::Result<Option<Term>> {

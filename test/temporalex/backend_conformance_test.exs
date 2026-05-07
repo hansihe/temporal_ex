@@ -96,4 +96,42 @@ defmodule Temporalex.BackendConformanceTest do
     assert is_binary(activity_bytes)
     assert byte_size(activity_bytes) > 0
   end
+
+  test "TemporalCore codec rejects invalid duration and retry options" do
+    assert {:error, timer_reason} =
+             Temporalex.Backend.TemporalCore.Codec.workflow_completion_to_bytes(
+               %Completion{
+                 run_id: "run-invalid-timer",
+                 status: {:ok, [%Command.StartTimer{seq: 0, duration_ms: -1}]}
+               },
+               task_queue: "temporalex-test"
+             )
+
+    assert timer_reason =~ "timer duration must be non-negative"
+
+    assert {:error, activity_reason} =
+             Temporalex.Backend.TemporalCore.Codec.workflow_completion_to_bytes(
+               %Completion{
+                 run_id: "run-invalid-activity",
+                 status:
+                   {:ok,
+                    [
+                      %Command.ScheduleActivity{
+                        seq: 0,
+                        thread_id: [],
+                        activity_id: "activity",
+                        type: "Example.activity",
+                        input: [],
+                        opts: [
+                          start_to_close_timeout: 10,
+                          retry_policy: [initial_interval: -1]
+                        ]
+                      }
+                    ]}
+               },
+               task_queue: "temporalex-test"
+             )
+
+    assert activity_reason =~ "retry_policy.initial_interval must be non-negative"
+  end
 end

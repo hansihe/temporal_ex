@@ -37,11 +37,78 @@ defmodule Temporalex.Native do
         _workflow_type,
         _task_queue,
         _input,
+        _opts,
         _pid,
         _ref
       ),
       do: :erlang.nif_error(:nif_not_loaded)
 
   def get_workflow_result(_client, _namespace, _workflow_id, _run_id, _pid, _ref),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def signal_workflow(
+        _client,
+        _namespace,
+        _workflow_id,
+        _run_id,
+        _signal_name,
+        _args,
+        _opts,
+        _pid,
+        _ref
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  def query_workflow(
+        _client,
+        _namespace,
+        _workflow_id,
+        _run_id,
+        _query_name,
+        _args,
+        _opts,
+        _pid,
+        _ref
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  def update_workflow(
+        _client,
+        _namespace,
+        _workflow_id,
+        _run_id,
+        _update_name,
+        _args,
+        _opts,
+        _pid,
+        _ref
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  def cancel_workflow(
+        _client,
+        _namespace,
+        _workflow_id,
+        _run_id,
+        _reason,
+        _request_id,
+        _pid,
+        _ref
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  def terminate_workflow(
+        _client,
+        _namespace,
+        _workflow_id,
+        _run_id,
+        _reason,
+        _details,
+        _pid,
+        _ref
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  def describe_workflow(_client, _namespace, _workflow_id, _run_id, _pid, _ref),
     do: :erlang.nif_error(:nif_not_loaded)
 end

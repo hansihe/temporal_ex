@@ -7,7 +7,7 @@ Temporalex is an experimental Elixir SDK for Temporal. The current beta-evaluati
 - a worker/server supervision tree
 - an in-memory backend for integration tests and SDK evaluation
 - a native Temporal Core/Rustler backend that runs against Temporal Server
-- a minimal client API for starting workflows and awaiting results
+- a Temporal Core-backed client API for start, result, signal, query, update, cancel, terminate, and describe operations
 
 ## Quick Evaluation
 
@@ -68,6 +68,15 @@ Start a worker against Temporal Server:
 {:ok, result} = Temporalex.Client.get_result(handle)
 ```
 
+Long-lived workflows can also be driven through the handle:
+
+```elixir
+:ok = Temporalex.Client.signal_workflow(handle, "approve", [%{approved_by: "alice"}])
+{:ok, state} = Temporalex.Client.query_workflow(handle, "status")
+{:ok, reply} = Temporalex.Client.update_workflow(handle, "add_item", [%{sku: "ABC"}])
+{:ok, description} = Temporalex.Client.describe_workflow(handle)
+```
+
 ## Verification
 
 Run the default suite:
@@ -82,6 +91,6 @@ If the Temporal CLI is installed, run the external smoke check:
 CARGO_HOME=$(pwd)/.cargo-home mix test --only external
 ```
 
-That check starts a headless `temporal server start-dev`, waits for a CLI health check, runs an end-to-end workflow through the Rust NIF and Temporal Core, and then shuts it down.
+That check starts a headless `temporal server start-dev`, waits for a CLI health check, runs end-to-end workflows through the Rust NIF and Temporal Core, exercises client signal/query/update/describe/terminate paths, and then shuts it down.
 
 The completed core and native review gates are recorded in `docs/review_gates.md`.

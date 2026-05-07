@@ -31,7 +31,57 @@ defmodule Temporalex.TemporalCoreIntegrationTest do
     end
   end
 
-  test "TemporalCore worker runs workflow and activity tasks against dev server" do
+  defmodule InteractiveWorkflow do
+    use Temporalex.Workflow
+
+    alias Temporalex.Workflow.API
+
+    def handle_query("state", _args, state), do: {:reply, state}
+
+    def run(initial) do
+      API.publish_state(initial)
+
+      state =
+        API.phase(initial,
+          signal: %{
+            "add" => fn [amount], state ->
+              state = state + amount
+              API.publish_state(state)
+              {:noreply, state}
+            end
+          },
+          update: %{
+            "add" => fn [amount], state ->
+              state = state + amount
+              API.publish_state(state)
+              {:reply, state, state}
+            end,
+            "finish" => fn _args, state ->
+              API.publish_state(state)
+              {:stop, :finished, state}
+            end
+          }
+        )
+
+      {:ok, state}
+    end
+  end
+
+  defmodule WaitingWorkflow do
+    use Temporalex.Workflow
+
+    alias Temporalex.Workflow.API
+
+    def handle_query("state", _args, state), do: {:reply, state}
+
+    def run(label) do
+      API.publish_state({:waiting, label})
+      API.sleep(60_000)
+      {:ok, {:completed, label}}
+    end
+  end
+
+  test "TemporalCore worker runs workflow tasks, activities, and client operations against dev server" do
     temporal =
       System.find_executable("temporal") || flunk("temporal CLI executable was not found")
 
@@ -56,7 +106,7 @@ defmodule Temporalex.TemporalCoreIntegrationTest do
           target: "http://127.0.0.1:#{port}",
           namespace: "default",
           task_queue: task_queue,
-          workflows: [Workflow],
+          workflows: [Workflow, InteractiveWorkflow, WaitingWorkflow],
           activities: [Activities],
           max_workflow_pollers: 2,
           max_activity_pollers: 2,
@@ -64,6 +114,15 @@ defmodule Temporalex.TemporalCoreIntegrationTest do
         )
 
       try do
+        assert {:error, invalid_start_reason} =
+                 Temporalex.Client.start_workflow(worker_name, Workflow, :invalid_options,
+                   workflow_id: "temporalex-invalid-#{System.unique_integer([:positive])}",
+                   workflow_task_timeout: -1,
+                   timeout: 10_000
+                 )
+
+        assert invalid_start_reason =~ "duration option must be non-negative"
+
         input = {:native, System.unique_integer([:positive])}
         workflow_id = "temporalex-native-#{System.unique_integer([:positive])}"
 
@@ -79,6 +138,71 @@ defmodule Temporalex.TemporalCoreIntegrationTest do
 
         assert {:ok, {:done, {:echo, ^input}, {:heartbeat, ^input}}} =
                  Temporalex.Client.get_result(handle, timeout: 30_000)
+
+        interactive_id = "temporalex-interactive-#{System.unique_integer([:positive])}"
+
+        assert {:ok, interactive} =
+                 Temporalex.Client.start_workflow(worker_name, InteractiveWorkflow, 0,
+                   workflow_id: interactive_id,
+                   workflow_task_timeout: 10_000,
+                   id_reuse_policy: :reject_duplicate,
+                   id_conflict_policy: :fail,
+                   static_summary: "Temporalex integration test",
+                   timeout: 10_000
+                 )
+
+        assert eventually(fn ->
+                 Temporalex.Client.query_workflow(interactive, "state", [], timeout: 10_000) ==
+                   {:ok, 0}
+               end)
+
+        assert :ok =
+                 Temporalex.Client.signal_workflow(interactive, "add", [2], timeout: 10_000)
+
+        assert eventually(fn ->
+                 Temporalex.Client.query_workflow(interactive, "state", [], timeout: 10_000) ==
+                   {:ok, 2}
+               end)
+
+        assert {:ok, 5} =
+                 Temporalex.Client.update_workflow(interactive, "add", [3], timeout: 15_000)
+
+        assert {:ok, description} =
+                 Temporalex.Client.describe_workflow(interactive, timeout: 10_000)
+
+        assert description.workflow_id == interactive_id
+        assert description.run_id == interactive.run_id
+        assert description.workflow_type == InteractiveWorkflow.__workflow_type__()
+        assert description.status == :running
+        assert is_integer(description.history_length)
+
+        assert {:ok, :finished} =
+                 Temporalex.Client.update_workflow(interactive, "finish", [], timeout: 15_000)
+
+        assert {:ok, 5} = Temporalex.Client.get_result(interactive, timeout: 30_000)
+
+        terminated_id = "temporalex-terminated-#{System.unique_integer([:positive])}"
+
+        assert {:ok, terminated} =
+                 Temporalex.Client.start_workflow(worker_name, WaitingWorkflow, :terminate,
+                   workflow_id: terminated_id,
+                   timeout: 10_000
+                 )
+
+        assert eventually(fn ->
+                 Temporalex.Client.query_workflow(terminated, "state", [], timeout: 10_000) ==
+                   {:ok, {:waiting, :terminate}}
+               end)
+
+        assert :ok =
+                 Temporalex.Client.terminate_workflow(terminated,
+                   reason: "integration test",
+                   details: :terminated_by_test,
+                   timeout: 10_000
+                 )
+
+        assert {:error, {:terminated, [:terminated_by_test]}} =
+                 Temporalex.Client.get_result(terminated, timeout: 30_000)
       after
         if Process.alive?(worker_pid) do
           Supervisor.stop(worker_pid, :normal, 15_000)
@@ -166,6 +290,24 @@ defmodule Temporalex.TemporalCoreIntegrationTest do
       {_port, {:exit_status, _status}} -> drain_port_messages()
     after
       100 -> :ok
+    end
+  end
+
+  defp eventually(fun, timeout \\ 10_000) when is_function(fun, 0) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_eventually(fun, deadline)
+  end
+
+  defp do_eventually(fun, deadline) do
+    if fun.() do
+      true
+    else
+      if System.monotonic_time(:millisecond) >= deadline do
+        false
+      else
+        Process.sleep(250)
+        do_eventually(fun, deadline)
+      end
     end
   end
 end

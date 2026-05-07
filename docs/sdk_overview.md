@@ -117,9 +117,9 @@ Each user worker instance owns its own worker tree:
 
 ```
 MyApp.Temporal (Supervisor, strategy: :rest_for_one)
-├── MyApp.Temporal.Server
 ├── MyApp.Temporal.ExecutorSupervisor
-└── MyApp.Temporal.ActivitySupervisor
+├── MyApp.Temporal.ActivitySupervisor
+└── MyApp.Temporal.Server
 ```
 
 The server owns backend state and monitors each executor. Executors trap exits and link to their runner processes. Activity work runs under the activity supervisor.
@@ -168,4 +168,5 @@ Current repository status:
 - Server/test-backend integration is implemented through `Temporalex.Worker`, `Temporalex.Server`, `Temporalex.Backend`, and `Temporalex.Backend.Test`.
 - Server verification lives in `test/temporalex/server_integration_test.exs` and covers worker supervision, executor registry cleanup, activation routing, activity task supervision, query routing, eviction, and completion submission.
 - `Temporalex.Backend.TemporalCore` is implemented through `Temporalex.Native`, Rustler resources, Temporal Core worker/client calls, native poll loops, protobuf conversion, and ETF payload conversion.
-- `Temporalex.Client.start_workflow/4` and `Temporalex.Client.get_result/2` are implemented for Temporal Core-backed workers. Signal, update, query, cancel, and terminate client calls remain future client API work.
+- `Temporalex.Client` is implemented for Temporal Core-backed workers with workflow start/result, signal, query, update, cancel, terminate, and describe operations.
+- `test/temporalex/integration/temporal_core_integration_test.exs` starts a Temporal dev server and verifies workflow execution, activity execution, heartbeats, invalid client option handling, signal/query/update/describe, termination, and result decoding through the Rust NIF.

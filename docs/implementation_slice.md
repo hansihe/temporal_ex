@@ -14,11 +14,11 @@ The repository has implemented the core through Slice 2 and the first server/bac
 - `test/temporalex/core_executor_test.exs` verifies the mandatory Slice 1 and Slice 2 scenarios that are in scope for the core.
 - `Temporalex.Worker`, `Temporalex.Server`, `Temporalex.Backend`, and `Temporalex.Backend.Test` implement the server/test-backend phase after the core slices.
 - `test/temporalex/server_integration_test.exs` and `test/temporalex/backend_conformance_test.exs` verify worker supervision, activation routing, executor registry cleanup, activity task supervision, completion submission, and the backend behaviour contract.
-- `Temporalex.Backend.TemporalCore`, `Temporalex.Native`, and the Rust crate in `native/temporalex_nif` implement the real Temporal Core/Rustler backend with native poll loops, protobuf conversion, ETF payloads, async completion submission, heartbeats, shutdown, and minimal client start/result operations.
-- `test/temporalex/integration/temporal_core_integration_test.exs` starts a Temporal dev server and verifies an end-to-end workflow through the Rust NIF and Temporal Core.
+- `Temporalex.Backend.TemporalCore`, `Temporalex.Native`, and the Rust crate in `native/temporalex_nif` implement the real Temporal Core/Rustler backend with native poll loops, protobuf conversion, ETF payloads, async completion submission, heartbeats, shutdown, workflow start options, activity retry/cancellation options, and client start/result/signal/query/update/cancel/terminate/describe operations.
+- `test/temporalex/integration/temporal_core_integration_test.exs` starts a Temporal dev server and verifies end-to-end workflows through the Rust NIF and Temporal Core, including activities, heartbeats, client operation RPCs, invalid client option handling, and termination result decoding.
 - Slice 1 and Slice 2 review gates are complete and recorded in [review_gates.md](review_gates.md).
 
-The next implementation work should focus on remaining client-facing operations, public error polish, packaging, and broader production hardening. Server/backend routing should not change executor scheduling semantics.
+The next implementation work should focus on full workflow cancellation propagation, public error polish, child workflows, local activities, Nexus operations, packaging, and broader production hardening. Server/backend routing should not change executor scheduling semantics.
 
 ## Slice 1: Sequential Core
 

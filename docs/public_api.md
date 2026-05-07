@@ -32,6 +32,7 @@ __workflow_defaults__/0
 {:ok, result}
 {:error, reason}
 {:continue_as_new, args}
+{:cancelled, reason}
 ```
 
 `handle_query/3` is optional. It receives query name, query args, and the last state published by `API.publish_state/1`.
@@ -155,34 +156,57 @@ The detailed semantics are in [programming_model.md](programming_model.md).
 
 ## Client API
 
-The implemented client API currently supports starting workflows and awaiting results through a running `Temporalex.Worker` that uses `Temporalex.Backend.TemporalCore`:
+The implemented client API talks through a running `Temporalex.Worker` that uses `Temporalex.Backend.TemporalCore`:
 
 ```elixir
 {:ok, handle} =
-  Temporalex.Client.start_workflow(conn, MyApp.Workflows.Checkout, %{order_id: 123},
+  Temporalex.Client.start_workflow(worker, MyApp.Workflows.Checkout, %{order_id: 123},
     workflow_id: "order-123"
   )
 
 {:ok, result} = Temporalex.Client.get_result(handle)
 ```
 
-`conn` is the worker instance name, for example `MyApp.Temporal`.
+`worker` is the worker instance name, for example `MyApp.Temporal`.
 
-The planned client API also includes workflow signaling, updates, queries, cancellation, and termination:
+Workflow operations are available through handles or `{worker, workflow_id}`:
 
 ```elixir
-:ok =
-  Temporalex.Client.signal_workflow(conn, "order-123", "approve", %{approved_by: "alice"})
+:ok = Temporalex.Client.signal_workflow(handle, "approve", [%{approved_by: "alice"}])
+{:ok, reply} = Temporalex.Client.update_workflow(handle, "add_item", [%{sku: "ABC"}])
+{:ok, state} = Temporalex.Client.query_workflow(handle, "status")
+{:ok, description} = Temporalex.Client.describe_workflow(handle)
 
-{:ok, reply} =
-  Temporalex.Client.update_workflow(conn, "order-123", "add_item", %{sku: "ABC"})
+:ok = Temporalex.Client.cancel_workflow(handle, reason: "user requested")
+:ok = Temporalex.Client.terminate_workflow(handle, reason: "manual override")
 
-{:ok, state} =
-  Temporalex.Client.query_workflow(conn, "order-123", "status")
-
-:ok = Temporalex.Client.cancel_workflow(conn, "order-123")
-:ok = Temporalex.Client.terminate_workflow(conn, "order-123", reason: "manual override")
+:ok = Temporalex.Client.signal_workflow(worker, "order-123", "approve", [])
+{:ok, state} = Temporalex.Client.query_workflow(worker, "order-123", "status", [])
 ```
+
+Start options accepted by the native backend include:
+
+```elixir
+workflow_id: "order-123",
+task_queue: "orders",
+headers: %{"trace_id" => trace_id},
+search_attributes: %{"CustomKeywordField" => "checkout"},
+workflow_execution_timeout: 86_400_000,
+workflow_run_timeout: 3_600_000,
+workflow_task_timeout: 10_000,
+retry_policy: [
+  initial_interval: 1_000,
+  backoff_coefficient: 2.0,
+  maximum_interval: 60_000,
+  maximum_attempts: 3,
+  non_retryable_error_types: ["ValidationError"]
+],
+id_reuse_policy: :reject_duplicate,
+id_conflict_policy: :fail,
+static_summary: "Checkout workflow"
+```
+
+Signal/update/query options accept `:headers`. Signal and cancel also accept `:request_id`; update accepts `:update_id`.
 
 ## Retry Policy
 
