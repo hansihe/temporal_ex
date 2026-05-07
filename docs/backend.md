@@ -106,6 +106,13 @@ assert %Core.Completion{} =
 
 These tests should remain valid when `Temporalex.Backend.TemporalCore` exists.
 
+Implementation status:
+
+- `Temporalex.Backend` is implemented as the server-facing behaviour.
+- `Temporalex.Backend.Test` is implemented and stores workflow/activity completions in memory for assertions.
+- `Temporalex.Backend.TemporalCore` exists as an explicit placeholder that returns `{:error, {:not_implemented, message}}` until the native bridge is added.
+- `test/temporalex/backend_conformance_test.exs` exercises the backend contract against the test backend and asserts the real backend placeholder fails clearly.
+
 ## Temporal Core Backend
 
 `Temporalex.Backend.TemporalCore` will implement the same behaviour using the real native layer.

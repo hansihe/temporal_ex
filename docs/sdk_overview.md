@@ -10,6 +10,7 @@ This document is the architecture map. Detailed contracts live in focused docs:
 | [public_api.md](public_api.md) | Public module-level API: workflow DSL, activity DSL, client API shape, retry policy, and error structs. |
 | [implementation_principles.md](implementation_principles.md) | Internal implementation rules, invariants, API admission criteria, and review checklist. |
 | [implementation_slice.md](implementation_slice.md) | Core implementation slices: sequential core first, then structured concurrency with `parallel`, `phase`, signals, updates, and queries. |
+| [review_gates.md](review_gates.md) | Completed Slice 1 and Slice 2 review-gate notes, evidence, outcomes, and alpha limits. |
 | [core.md](core.md) | Deterministic executor/runner kernel, internal structs, replay rules, scheduling, and invariants. |
 | [scheduler_and_replay.md](scheduler_and_replay.md) | Deterministic scheduler rounds, pause points, activation turns, command decisions, and replay matching. |
 | [core_testing.md](core_testing.md) | Test harness and test strategy for validating the core without Temporal or Rustler. |
@@ -164,4 +165,7 @@ Current repository status:
 
 - Slice 1 and Slice 2 core behavior are implemented in `lib/temporalex/core/*`, `lib/temporalex/workflow/*`, and `lib/temporalex/activity.ex`.
 - Core verification lives in `test/temporalex/core_executor_test.exs` and covers sequential execution, replay matching, deterministic `parallel`, `phase`, signals, updates, queries, and process lifecycle.
-- Server, backend, activity worker supervision, Rustler, protobuf conversion, and client APIs remain intentionally out of scope for the next implementation phase.
+- Server/test-backend integration is implemented through `Temporalex.Worker`, `Temporalex.Server`, `Temporalex.Backend`, and `Temporalex.Backend.Test`.
+- Server verification lives in `test/temporalex/server_integration_test.exs` and covers worker supervision, executor registry cleanup, activation routing, activity task supervision, query routing, eviction, and completion submission.
+- `Temporalex.Backend.TemporalCore` is an explicit placeholder that fails until the native Temporal Core/Rustler and protobuf bridge is implemented.
+- Client APIs remain intentionally out of scope for this alpha surface.

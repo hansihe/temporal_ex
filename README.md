@@ -1,21 +1,65 @@
 # Temporalex
 
-**TODO: Add description**
+Temporalex is an experimental Elixir SDK for Temporal. The current alpha surface includes:
 
-## Installation
+- deterministic workflow execution in pure Elixir
+- activities, durable timers, signals, updates, queries, `parallel`, and `phase`
+- a worker/server supervision tree
+- an in-memory backend for integration tests and SDK evaluation
 
-If [available in Hex](https://hex.pm/docs/publish), the package can be installed
-by adding `temporalex` to your list of dependencies in `mix.exs`:
+The native Temporal Core/Rustler backend is not implemented yet. `Temporalex.Backend.TemporalCore` fails explicitly until that bridge exists.
+
+## Quick Evaluation
+
+Define a workflow and activity:
 
 ```elixir
-def deps do
-  [
-    {:temporalex, "~> 0.1.0"}
-  ]
+defmodule MyApp.Activities do
+  use Temporalex.Activity
+
+  defactivity echo(value) do
+    {:ok, value}
+  end
+end
+
+defmodule MyApp.Workflow do
+  use Temporalex.Workflow
+
+  def run(value) do
+    {:ok, result} = MyApp.Activities.echo(value)
+    {:ok, result}
+  end
 end
 ```
 
-Documentation can be generated with [ExDoc](https://github.com/elixir-lang/ex_doc)
-and published on [HexDocs](https://hexdocs.pm). Once published, the docs can
-be found at <https://hexdocs.pm/temporalex>.
+Start a worker with the test backend:
 
+```elixir
+start_supervised!(
+  {Temporalex.Worker,
+   name: MyApp.Temporal,
+   backend: Temporalex.Backend.Test,
+   workflows: [MyApp.Workflow],
+   activities: [MyApp.Activities]}
+)
+```
+
+Tests can drive the server with core structs through `Temporalex.Backend.Test`. See `test/temporalex/server_integration_test.exs` for full activation and activity-task transcripts.
+
+## Verification
+
+Run the default suite:
+
+```bash
+mix test
+```
+
+If the Temporal CLI is installed, run the external smoke check:
+
+```bash
+mix test --only external
+```
+
+That check starts a headless `temporal server start-dev`, waits for a CLI health check, and then shuts it down. Full Temporal workflow execution requires the future native backend.
+
+The completed core review gates are recorded in `docs/review_gates.md`.

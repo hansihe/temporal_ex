@@ -6,14 +6,17 @@ Use this with [implementation_principles.md](implementation_principles.md), [cor
 
 ## Current Status
 
-The repository has implemented the core through Slice 2:
+The repository has implemented the core through Slice 2 and the first server/backend integration layer:
 
 - `Temporalex.Core.Executor` owns activation turns, scheduler rounds, replay matching, runner lifecycle, command sequencing, `parallel`, `phase`, signals, updates, and queries.
 - `Temporalex.Workflow.API`, `Temporalex.Workflow`, and `Temporalex.Activity` provide the core-facing public workflow and activity surface for these slices.
 - `Temporalex.Core.TestHarness` drives pure core activation transcripts and replay tests without server/backend/Rustler dependencies.
 - `test/temporalex/core_executor_test.exs` verifies the mandatory Slice 1 and Slice 2 scenarios that are in scope for the core.
+- `Temporalex.Worker`, `Temporalex.Server`, `Temporalex.Backend`, and `Temporalex.Backend.Test` implement the server/test-backend phase after the core slices.
+- `test/temporalex/server_integration_test.exs` and `test/temporalex/backend_conformance_test.exs` verify worker supervision, activation routing, executor registry cleanup, activity task supervision, completion submission, and the backend behaviour contract.
+- Slice 1 and Slice 2 review gates are complete and recorded in [review_gates.md](review_gates.md).
 
-The next implementation work should follow the Slice 2 review gate below before moving outward to server/backend integration.
+The next implementation work should start the native Temporal Core/Rustler bridge or client-facing APIs. Server/backend routing should not change executor scheduling semantics.
 
 ## Slice 1: Sequential Core
 
@@ -428,13 +431,13 @@ If both core slices and both review gates are complete, implementation moves out
 
 The next work should be server/backend integration, not new workflow semantics:
 
-1. Server process and supervision shape.
-2. Executor registry and pending activation registry.
-3. Test backend that delivers core structs and captures completions.
-4. Server-to-executor activation routing.
-5. Activity task supervision and activity completion submission.
-6. Backend conformance tests shared by the test backend and real backend.
-7. Temporal Core/Rustler backend that translates protobuf/Core messages into the same core structs.
+1. [x] Server process and supervision shape.
+2. [x] Executor registry and pending activation registry.
+3. [x] Test backend that delivers core structs and captures completions.
+4. [x] Server-to-executor activation routing.
+5. [x] Activity task supervision and activity completion submission.
+6. [x] Backend conformance tests for the stable backend behaviour, currently exercised by the test backend with the real backend represented by an explicit placeholder.
+7. [ ] Temporal Core/Rustler backend that translates protobuf/Core messages into the same core structs.
 
 The rule for this phase:
 
