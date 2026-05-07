@@ -36,6 +36,22 @@ defmodule Temporalex.Workflow.API do
     call(%Op.Now{})
   end
 
+  def random do
+    call(%Op.Random{})
+  end
+
+  def uuid4 do
+    call(%Op.UUID4{})
+  end
+
+  def patched?(patch_id) when is_binary(patch_id) do
+    call(%Op.Patched{id: patch_id})
+  end
+
+  def deprecate_patch(patch_id) when is_binary(patch_id) do
+    call(%Op.DeprecatePatch{id: patch_id})
+  end
+
   def upsert_search_attributes(attrs) when is_map(attrs) do
     call(%Op.UpsertSearchAttributes{attrs: attrs})
   end
@@ -59,22 +75,6 @@ defmodule Temporalex.Workflow.API do
       result ->
         result
     end
-  end
-
-  def random do
-    raise "Temporalex.Workflow.API.random/0 is not implemented in the Slice 2 core"
-  end
-
-  def uuid4 do
-    raise "Temporalex.Workflow.API.uuid4/0 is not implemented in the Slice 2 core"
-  end
-
-  def patched?(_patch_id) do
-    raise "Temporalex.Workflow.API.patched?/1 is not implemented in the Slice 2 core"
-  end
-
-  def deprecate_patch(_patch_id) do
-    raise "Temporalex.Workflow.API.deprecate_patch/1 is not implemented in the Slice 2 core"
   end
 
   def context! do

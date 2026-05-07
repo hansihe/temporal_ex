@@ -10,6 +10,8 @@ defmodule Temporalex.Core.Executor do
 
   use GenServer
 
+  import Bitwise
+
   alias Temporalex.Core.Activation
   alias Temporalex.Core.Command
   alias Temporalex.Core.Completion
@@ -41,6 +43,8 @@ defmodule Temporalex.Core.Executor do
               available_internal_flags: [],
               deployment_version: nil,
               randomness_seed: 0,
+              patch_ids: MapSet.new(),
+              patch_markers: MapSet.new(),
               cancelled?: false,
               initialized?: false,
               evicted?: false,
@@ -195,8 +199,8 @@ defmodule Temporalex.Core.Executor do
         %Job.CancelWorkflow{} ->
           {query_jobs, %{state | cancelled?: true}}
 
-        %Job.NotifyPatch{} ->
-          {query_jobs, state}
+        %Job.NotifyPatch{id: id} ->
+          {query_jobs, %{state | patch_ids: MapSet.put(state.patch_ids, id)}}
 
         %Job.RemoveFromCache{} ->
           {query_jobs, teardown_threads(%{state | evicted?: true})}
@@ -445,6 +449,30 @@ defmodule Temporalex.Core.Executor do
 
   defp handle_workflow_op(state, from, _thread_id, %Op.Now{}) do
     GenServer.reply(from, state.timestamp)
+    state
+  end
+
+  defp handle_workflow_op(state, from, _thread_id, %Op.Random{}) do
+    {value, seed} = next_random_float(state.randomness_seed)
+    GenServer.reply(from, value)
+    %{state | randomness_seed: seed}
+  end
+
+  defp handle_workflow_op(state, from, _thread_id, %Op.UUID4{}) do
+    {uuid, seed} = next_uuid4(state.randomness_seed)
+    GenServer.reply(from, uuid)
+    %{state | randomness_seed: seed}
+  end
+
+  defp handle_workflow_op(state, from, _thread_id, %Op.Patched{id: id}) do
+    {patched?, state} = apply_patch_check(state, id)
+    GenServer.reply(from, patched?)
+    state
+  end
+
+  defp handle_workflow_op(state, from, _thread_id, %Op.DeprecatePatch{id: id}) do
+    state = apply_patch_deprecation(state, id)
+    GenServer.reply(from, :ok)
     state
   end
 
@@ -888,6 +916,10 @@ defmodule Temporalex.Core.Executor do
     append_command(state, %Command.ContinueAsNew{args: args, workflow_type: state.workflow_type})
   end
 
+  defp complete_root_thread(state, {:cancelled, _reason}) do
+    append_command(state, %Command.CancelWorkflow{})
+  end
+
   defp complete_root_thread(state, other) do
     append_command(state, %Command.FailWorkflow{reason: {:unsupported_workflow_return, other}})
   end
@@ -1237,6 +1269,7 @@ defmodule Temporalex.Core.Executor do
 
   defp command_identity(%Command.FailWorkflow{} = command), do: {:fail_workflow, command.reason}
   defp command_identity(%Command.ContinueAsNew{} = command), do: {:continue_as_new, command.args}
+  defp command_identity(%Command.CancelWorkflow{}), do: :cancel_workflow
 
   defp command_identity(%Command.RespondToUpdate{} = command),
     do: {:respond_update, command.protocol_instance_id, command.response}
@@ -1318,5 +1351,87 @@ defmodule Temporalex.Core.Executor do
     end)
 
     %{state | threads: %{}, pending: %{}, signal_waiters: %{}, phase: nil, parallel_scopes: %{}}
+  end
+
+  @u64_mask 0xFFFFFFFFFFFFFFFF
+  @float_denominator 9_007_199_254_740_992
+
+  defp next_random_float(seed) do
+    seed = next_random_seed(seed)
+    mantissa = bsr(seed, 11)
+    {mantissa / @float_denominator, seed}
+  end
+
+  defp next_uuid4(seed) do
+    first = next_random_seed(seed)
+    second = next_random_seed(first)
+    bytes = <<first::unsigned-size(64), second::unsigned-size(64)>>
+
+    <<a::binary-size(6), _version_nibble::4, rest_nibble::4, byte7::binary-size(1),
+      _variant_seed::2, variant_rest::6, tail::binary>> = bytes
+
+    uuid_bytes =
+      <<a::binary, 4::4, rest_nibble::4, byte7::binary, 2::2, variant_rest::6, tail::binary>>
+
+    <<p1::binary-size(4), p2::binary-size(2), p3::binary-size(2), p4::binary-size(2),
+      p5::binary-size(6)>> = uuid_bytes
+
+    uuid =
+      [p1, p2, p3, p4, p5]
+      |> Enum.map(&Base.encode16(&1, case: :lower))
+      |> Enum.join("-")
+
+    {uuid, second}
+  end
+
+  defp next_random_seed(0), do: next_random_seed(0x9E3779B97F4A7C15)
+
+  defp next_random_seed(seed) do
+    seed = band(seed, @u64_mask)
+    seed = seed |> bxor(bsl(seed, 13)) |> band(@u64_mask)
+    seed = seed |> bxor(bsr(seed, 7)) |> band(@u64_mask)
+    seed |> bxor(bsl(seed, 17)) |> band(@u64_mask)
+  end
+
+  defp apply_patch_check(state, id) do
+    marker = {id, false}
+
+    cond do
+      MapSet.member?(state.patch_ids, id) ->
+        {true, emit_patch_marker(state, marker, id, false)}
+
+      state.is_replaying ->
+        {false, state}
+
+      true ->
+        {true,
+         state
+         |> Map.update!(:patch_ids, &MapSet.put(&1, id))
+         |> emit_patch_marker(marker, id, false)}
+    end
+  end
+
+  defp apply_patch_deprecation(state, id) do
+    marker = {id, true}
+
+    cond do
+      MapSet.member?(state.patch_ids, id) or not state.is_replaying ->
+        state
+        |> Map.update!(:patch_ids, &MapSet.put(&1, id))
+        |> emit_patch_marker(marker, id, true)
+
+      true ->
+        state
+    end
+  end
+
+  defp emit_patch_marker(state, marker, id, deprecated?) do
+    if MapSet.member?(state.patch_markers, marker) do
+      state
+    else
+      state
+      |> Map.update!(:patch_markers, &MapSet.put(&1, marker))
+      |> append_command(%Command.SetPatchMarker{id: id, deprecated: deprecated?})
+    end
   end
 end

@@ -75,7 +75,12 @@ defmodule Temporalex.BackendConformanceTest do
              Temporalex.Backend.TemporalCore.Codec.workflow_completion_to_bytes(
                %Completion{
                  run_id: "run-codec",
-                 status: {:ok, [%Command.StartTimer{seq: 0, duration_ms: 10}]}
+                 status:
+                   {:ok,
+                    [
+                      %Command.StartTimer{seq: 0, duration_ms: 10},
+                      %Command.UpsertSearchAttributes{attrs: %{"CustomKeywordField" => "alpha"}}
+                    ]}
                },
                task_queue: "temporalex-test"
              )

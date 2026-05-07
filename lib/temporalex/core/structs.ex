@@ -301,6 +301,26 @@ defmodule Temporalex.Core.Op.Now do
   defstruct []
 end
 
+defmodule Temporalex.Core.Op.Random do
+  @moduledoc false
+  defstruct []
+end
+
+defmodule Temporalex.Core.Op.UUID4 do
+  @moduledoc false
+  defstruct []
+end
+
+defmodule Temporalex.Core.Op.Patched do
+  @moduledoc false
+  defstruct [:id]
+end
+
+defmodule Temporalex.Core.Op.DeprecatePatch do
+  @moduledoc false
+  defstruct [:id]
+end
+
 defmodule Temporalex.Core.Op.UpsertSearchAttributes do
   @moduledoc false
   defstruct attrs: %{}

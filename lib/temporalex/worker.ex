@@ -24,9 +24,9 @@ defmodule Temporalex.Worker do
       |> Keyword.put(:activity_supervisor, activity_supervisor_name)
 
     children = [
-      {Temporalex.Server, server_opts},
       {DynamicSupervisor, strategy: :one_for_one, name: executor_supervisor_name},
-      {Task.Supervisor, name: activity_supervisor_name}
+      {Task.Supervisor, name: activity_supervisor_name},
+      {Temporalex.Server, server_opts}
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)

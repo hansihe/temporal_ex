@@ -23,15 +23,15 @@ use temporalio_common::protos::coresdk::workflow_activation::{
 use temporalio_common::protos::coresdk::workflow_commands::{
     CancelTimer, CancelWorkflowExecution, CompleteWorkflowExecution,
     ContinueAsNewWorkflowExecution, FailWorkflowExecution, QueryResult, QuerySuccess,
-    ScheduleActivity, SetPatchMarker, StartTimer, UpdateResponse, WorkflowCommand, query_result,
-    update_response, workflow_command,
+    ScheduleActivity, SetPatchMarker, StartTimer, UpdateResponse, UpsertWorkflowSearchAttributes,
+    WorkflowCommand, query_result, update_response, workflow_command,
 };
 use temporalio_common::protos::coresdk::workflow_completion::{
     Failure as WorkflowCompletionFailure, Success as WorkflowCompletionSuccess,
     WorkflowActivationCompletion, workflow_activation_completion,
 };
 use temporalio_common::protos::coresdk::{ActivityHeartbeat, ActivityTaskCompletion};
-use temporalio_common::protos::temporal::api::common::v1::{Payload, Payloads};
+use temporalio_common::protos::temporal::api::common::v1::{Payload, Payloads, SearchAttributes};
 use temporalio_common::protos::temporal::api::enums::v1::{
     VersioningBehavior, WorkflowTaskFailedCause,
 };
@@ -99,6 +99,7 @@ rustler::atoms! {
     workflow_id,
     arguments,
     headers,
+    attrs,
     workflow_info,
     randomness_seed,
     seq,
@@ -1214,6 +1215,15 @@ fn command_from_term(command: Term, default_task_queue: &str) -> anyhow::Result<
                     .unwrap_or(false),
             })
         }
+        "Elixir.Temporalex.Core.Command.UpsertSearchAttributes" => {
+            workflow_command::Variant::UpsertWorkflowSearchAttributes(
+                UpsertWorkflowSearchAttributes {
+                    search_attributes: Some(SearchAttributes {
+                        indexed_fields: term_to_payload_map(map_get(command, attrs())?)?,
+                    }),
+                },
+            )
+        }
         unsupported => return Err(anyhow!("unsupported workflow command {unsupported}")),
     };
 
@@ -1403,6 +1413,10 @@ fn keyword_get_payload_map(opts: Term, key: Atom) -> anyhow::Result<HashMap<Stri
         return Ok(HashMap::new());
     };
 
+    term_to_payload_map(term)
+}
+
+fn term_to_payload_map(term: Term) -> anyhow::Result<HashMap<String, Payload>> {
     let iterator = MapIterator::new(term).ok_or_else(|| anyhow!("headers option must be a map"))?;
     let mut headers = HashMap::new();
 

@@ -33,6 +33,12 @@ defmodule Temporalex.CoreExecutorTest do
     def run(args), do: {:continue_as_new, args}
   end
 
+  defmodule CancelledWorkflow do
+    use Temporalex.Workflow
+
+    def run(_), do: {:cancelled, :requested}
+  end
+
   defmodule UnsupportedReturnWorkflow do
     use Temporalex.Workflow
 
@@ -80,6 +86,33 @@ defmodule Temporalex.CoreExecutorTest do
 
     def run(_) do
       {:ok, %{info: API.workflow_info(), cancelled?: API.cancelled?(), now: API.now()}}
+    end
+  end
+
+  defmodule RandomWorkflow do
+    use Temporalex.Workflow
+
+    def run(_) do
+      {:ok, %{random: [API.random(), API.random()], uuid: API.uuid4()}}
+    end
+  end
+
+  defmodule PatchWorkflow do
+    use Temporalex.Workflow
+
+    def run(_) do
+      enabled? = API.patched?("new-path")
+      API.deprecate_patch("old-path")
+      {:ok, enabled?}
+    end
+  end
+
+  defmodule SearchAttributesWorkflow do
+    use Temporalex.Workflow
+
+    def run(_) do
+      :ok = API.upsert_search_attributes(%{"CustomKeywordField" => "alpha"})
+      {:ok, :done}
     end
   end
 
@@ -331,6 +364,9 @@ defmodule Temporalex.CoreExecutorTest do
       assert {:ok, exec} = TestHarness.start_workflow(ContinueWorkflow, [:next])
       assert {:continue_as_new, [:next]} = TestHarness.next(exec)
 
+      assert {:ok, exec} = TestHarness.start_workflow(CancelledWorkflow, nil)
+      assert {:yield, [%Command.CancelWorkflow{}]} = TestHarness.next(exec)
+
       assert {:ok, exec} = TestHarness.start_workflow(UnsupportedReturnWorkflow, :ignored)
 
       assert {:complete, {:error, {:unsupported_workflow_return, :bad_return}}} =
@@ -412,6 +448,27 @@ defmodule Temporalex.CoreExecutorTest do
                TestHarness.resolve(exec, %Job.TimerFired{seq: command.seq})
     end
 
+    test "search attribute upsert is a non-pausing workflow command" do
+      assert {:ok, exec} = TestHarness.start_workflow(SearchAttributesWorkflow, nil)
+
+      completion =
+        TestHarness.activate_raw(exec, [
+          %Job.InitializeWorkflow{
+            workflow_type: inspect(SearchAttributesWorkflow),
+            workflow_id: "wf-search-attrs",
+            arguments: [nil],
+            workflow_info: %{},
+            randomness_seed: 0
+          }
+        ])
+
+      assert {:ok,
+              [
+                %Command.UpsertSearchAttributes{attrs: %{"CustomKeywordField" => "alpha"}},
+                %Command.CompleteWorkflow{result: :done}
+              ]} = completion.status
+    end
+
     test "activity followed by timer keeps monotonic command sequence" do
       assert {:ok, exec} = TestHarness.start_workflow(ActivityThenTimerWorkflow, :value)
       assert {:yield, [%Command.ScheduleActivity{seq: 0} = activity]} = TestHarness.next(exec)
@@ -446,6 +503,82 @@ defmodule Temporalex.CoreExecutorTest do
       assert result.now == ~U[2026-05-07 12:00:00Z]
       assert result.info.workflow_id == "wf-info"
       assert result.info.task_queue == "test"
+    end
+
+    test "deterministic random and UUID derive from replayed seed" do
+      assert {:ok, first} = TestHarness.start_workflow(RandomWorkflow, nil)
+      assert {:ok, second} = TestHarness.start_workflow(RandomWorkflow, nil)
+
+      assert {:complete, {:ok, first_result}} =
+               TestHarness.next(first, randomness_seed: 123_456_789)
+
+      assert {:complete, {:ok, second_result}} =
+               TestHarness.next(second, randomness_seed: 123_456_789)
+
+      assert first_result == second_result
+      assert [a, b] = first_result.random
+      assert is_float(a)
+      assert is_float(b)
+      assert a >= 0.0 and a < 1.0
+      assert b >= 0.0 and b < 1.0
+
+      assert first_result.uuid =~
+               ~r/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+    end
+
+    test "patch APIs emit markers on new executions and respect replay notifications" do
+      assert {:ok, exec} = TestHarness.start_workflow(PatchWorkflow, nil)
+
+      assert {:ok,
+              [
+                %Command.SetPatchMarker{id: "new-path", deprecated: false},
+                %Command.SetPatchMarker{id: "old-path", deprecated: true},
+                %Command.CompleteWorkflow{result: true}
+              ]} =
+               TestHarness.activate_raw(exec, [
+                 %Job.InitializeWorkflow{
+                   workflow_type: inspect(PatchWorkflow),
+                   workflow_id: "wf-patch",
+                   arguments: [nil],
+                   workflow_info: %{},
+                   randomness_seed: 0
+                 }
+               ]).status
+
+      assert {:ok, exec} = TestHarness.start_workflow(PatchWorkflow, nil)
+
+      assert {:ok,
+              [
+                %Command.SetPatchMarker{id: "new-path", deprecated: false},
+                %Command.CompleteWorkflow{result: true}
+              ]} =
+               TestHarness.activate_raw(
+                 exec,
+                 [
+                   %Job.NotifyPatch{id: "new-path"},
+                   %Job.InitializeWorkflow{
+                     workflow_type: inspect(PatchWorkflow),
+                     workflow_id: "wf-patch-replay",
+                     arguments: [nil],
+                     workflow_info: %{},
+                     randomness_seed: 0
+                   }
+                 ], replay: true).status
+
+      assert {:ok, exec} = TestHarness.start_workflow(PatchWorkflow, nil)
+
+      assert {:ok, [%Command.CompleteWorkflow{result: false}]} =
+               TestHarness.activate_raw(
+                 exec,
+                 [
+                   %Job.InitializeWorkflow{
+                     workflow_type: inspect(PatchWorkflow),
+                     workflow_id: "wf-patch-old-replay",
+                     arguments: [nil],
+                     workflow_info: %{},
+                     randomness_seed: 0
+                   }
+                 ], replay: true).status
     end
 
     test "workflow processes carry only the Temporalex context key" do
