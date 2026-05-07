@@ -57,6 +57,9 @@ defmodule Temporalex.Backend.Test do
   end
 
   @impl Temporalex.Backend
+  def record_activity_heartbeat(%State{}, _task_token, _details), do: :ok
+
+  @impl Temporalex.Backend
   def shutdown_worker(%State{} = state) do
     if Process.alive?(state.agent) do
       Agent.update(state.agent, &Map.put(&1, :shutdown?, true))

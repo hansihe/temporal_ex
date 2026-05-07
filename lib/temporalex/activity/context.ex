@@ -3,8 +3,8 @@ defmodule Temporalex.Activity.Context do
   Runtime context passed to activity implementations that declare a context
   argument.
 
-  Heartbeats are local-only for the alpha server boundary. The real backend can
-  extend this module to submit heartbeat payloads through Temporal Core.
+  Heartbeats are submitted through the worker backend when the activity is running
+  under a `Temporalex.Server`.
   """
 
   defstruct activity_id: nil,
@@ -22,11 +22,17 @@ defmodule Temporalex.Activity.Context do
             cancelled: nil,
             cancel_reason: nil
 
-  def heartbeat(%__MODULE__{} = context, _details \\ nil) do
+  def heartbeat(%__MODULE__{} = context, details \\ nil) do
     if cancelled?(context) do
       {:cancelled, context.cancel_reason || :cancelled}
     else
-      :ok
+      with :ok <- submit_heartbeat(context, details) do
+        if cancelled?(context) do
+          {:cancelled, context.cancel_reason || :cancelled}
+        else
+          :ok
+        end
+      end
     end
   end
 
@@ -34,5 +40,12 @@ defmodule Temporalex.Activity.Context do
 
   def cancelled?(%__MODULE__{cancelled: cancelled}) do
     :atomics.get(cancelled, 1) == 1
+  end
+
+  defp submit_heartbeat(%__MODULE__{worker: nil}, _details), do: :ok
+  defp submit_heartbeat(%__MODULE__{task_token: nil}, _details), do: :ok
+
+  defp submit_heartbeat(%__MODULE__{} = context, details) do
+    Temporalex.Server.record_activity_heartbeat(context.worker, context.task_token, details)
   end
 end

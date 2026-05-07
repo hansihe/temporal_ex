@@ -1,13 +1,13 @@
 # Temporalex
 
-Temporalex is an experimental Elixir SDK for Temporal. The current alpha surface includes:
+Temporalex is an experimental Elixir SDK for Temporal. The current beta-evaluation surface includes:
 
 - deterministic workflow execution in pure Elixir
 - activities, durable timers, signals, updates, queries, `parallel`, and `phase`
 - a worker/server supervision tree
 - an in-memory backend for integration tests and SDK evaluation
-
-The native Temporal Core/Rustler backend is not implemented yet. `Temporalex.Backend.TemporalCore` fails explicitly until that bridge exists.
+- a native Temporal Core/Rustler backend that runs against Temporal Server
+- a minimal client API for starting workflows and awaiting results
 
 ## Quick Evaluation
 
@@ -46,20 +46,42 @@ start_supervised!(
 
 Tests can drive the server with core structs through `Temporalex.Backend.Test`. See `test/temporalex/server_integration_test.exs` for full activation and activity-task transcripts.
 
+Start a worker against Temporal Server:
+
+```elixir
+{:ok, _worker} =
+  Temporalex.Worker.start_link(
+    name: MyApp.Temporal,
+    backend: Temporalex.Backend.TemporalCore,
+    target: "http://127.0.0.1:7233",
+    namespace: "default",
+    task_queue: "my-task-queue",
+    workflows: [MyApp.Workflow],
+    activities: [MyApp.Activities]
+  )
+
+{:ok, handle} =
+  Temporalex.Client.start_workflow(MyApp.Temporal, MyApp.Workflow, %{order_id: 123},
+    workflow_id: "order-123"
+  )
+
+{:ok, result} = Temporalex.Client.get_result(handle)
+```
+
 ## Verification
 
 Run the default suite:
 
 ```bash
-mix test
+CARGO_HOME=$(pwd)/.cargo-home mix test
 ```
 
 If the Temporal CLI is installed, run the external smoke check:
 
 ```bash
-mix test --only external
+CARGO_HOME=$(pwd)/.cargo-home mix test --only external
 ```
 
-That check starts a headless `temporal server start-dev`, waits for a CLI health check, and then shuts it down. Full Temporal workflow execution requires the future native backend.
+That check starts a headless `temporal server start-dev`, waits for a CLI health check, runs an end-to-end workflow through the Rust NIF and Temporal Core, and then shuts it down.
 
-The completed core review gates are recorded in `docs/review_gates.md`.
+The completed core and native review gates are recorded in `docs/review_gates.md`.

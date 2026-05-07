@@ -22,5 +22,11 @@ defmodule Temporalex.Backend do
               Temporalex.Core.ActivityCompletion.t()
             ) :: :ok | {:error, term()}
 
+  @callback record_activity_heartbeat(
+              state(),
+              task_token :: binary(),
+              details :: term()
+            ) :: :ok | {:error, term()}
+
   @callback shutdown_worker(state()) :: :ok | {:error, term()}
 end

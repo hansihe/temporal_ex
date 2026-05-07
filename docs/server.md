@@ -185,7 +185,7 @@ On worker shutdown:
 
 ## Implementation Status
 
-The alpha server layer is implemented with these modules:
+The server layer is implemented with these modules:
 
 - `Temporalex.Worker` starts the documented `:rest_for_one` worker tree.
 - `Temporalex.Server` owns backend state, workflow/activity registration maps, executor monitors, pending activation tracking, activation routing, and activity task supervision.

@@ -155,16 +155,22 @@ The detailed semantics are in [programming_model.md](programming_model.md).
 
 ## Client API
 
-The planned client API targets application code outside workflows:
+The implemented client API currently supports starting workflows and awaiting results through a running `Temporalex.Worker` that uses `Temporalex.Backend.TemporalCore`:
 
 ```elixir
 {:ok, handle} =
   Temporalex.Client.start_workflow(conn, MyApp.Workflows.Checkout, %{order_id: 123},
-    id: "order-123"
+    workflow_id: "order-123"
   )
 
 {:ok, result} = Temporalex.Client.get_result(handle)
+```
 
+`conn` is the worker instance name, for example `MyApp.Temporal`.
+
+The planned client API also includes workflow signaling, updates, queries, cancellation, and termination:
+
+```elixir
 :ok =
   Temporalex.Client.signal_workflow(conn, "order-123", "approve", %{approved_by: "alice"})
 
@@ -177,8 +183,6 @@ The planned client API targets application code outside workflows:
 :ok = Temporalex.Client.cancel_workflow(conn, "order-123")
 :ok = Temporalex.Client.terminate_workflow(conn, "order-123", reason: "manual override")
 ```
-
-`conn` is the worker instance name, for example `MyApp.Temporal`.
 
 ## Retry Policy
 

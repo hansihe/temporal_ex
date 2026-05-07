@@ -33,12 +33,18 @@ defmodule Temporalex.Backend do
               Temporalex.Core.ActivityCompletion.t()
             ) :: :ok | {:error, term()}
 
+  @callback record_activity_heartbeat(
+              state(),
+              task_token :: binary(),
+              details :: term()
+            ) :: :ok | {:error, term()}
+
   @callback shutdown_worker(state()) ::
               :ok | {:error, term()}
 end
 ```
 
-Client operations can be added later as separate callbacks or a separate client backend. The first backend contract should focus on worker execution.
+Client operations currently live on `Temporalex.Client` and use the opaque Temporal Core backend state for workflow start/result calls. Signal, update, query, cancel, and terminate operations can be added later as separate callbacks or a separate client backend.
 
 ## Backend Messages
 
@@ -110,16 +116,17 @@ Implementation status:
 
 - `Temporalex.Backend` is implemented as the server-facing behaviour.
 - `Temporalex.Backend.Test` is implemented and stores workflow/activity completions in memory for assertions.
-- `Temporalex.Backend.TemporalCore` exists as an explicit placeholder that returns `{:error, {:not_implemented, message}}` until the native bridge is added.
-- `test/temporalex/backend_conformance_test.exs` exercises the backend contract against the test backend and asserts the real backend placeholder fails clearly.
+- `Temporalex.Backend.TemporalCore` is implemented through Rustler and Temporal Core.
+- `test/temporalex/backend_conformance_test.exs` exercises the backend contract against the test backend and verifies native codec encoding for core completions.
+- `test/temporalex/integration/temporal_core_integration_test.exs` exercises the real backend against a Temporal dev server.
 
 ## Temporal Core Backend
 
-`Temporalex.Backend.TemporalCore` will implement the same behaviour using the real native layer.
+`Temporalex.Backend.TemporalCore` implements the same behaviour using the real native layer.
 
 Responsibilities:
 
-- create or obtain the native runtime
+- create the native runtime resource
 - connect to Temporal
 - start a Temporal Core worker
 - run native poll loops
@@ -128,9 +135,11 @@ Responsibilities:
 - encode `%Temporalex.Core.Completion{}` into workflow activation completion bytes
 - encode `%Temporalex.Core.ActivityCompletion{}` into activity completion bytes
 - submit completions through Rustler NIFs
+- submit activity heartbeats through Rustler NIFs
+- shut workers down from explicit terminate paths, resource monitor `DOWN`, and resource drop
 - convert payloads with `:erlang.term_to_binary/1` and `:erlang.binary_to_term/1`
 
-The codec modules can live under the real backend, for example:
+The codec modules live under the real backend:
 
 ```elixir
 Temporalex.Backend.TemporalCore.Codec

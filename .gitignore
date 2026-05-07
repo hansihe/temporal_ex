@@ -7,6 +7,12 @@
 # The directory Mix downloads your dependencies sources to.
 /deps/
 
+# Local Rust/Cargo cache and native build output.
+/.cargo-home/
+/native/*/target/
+/native/temporalex_nif/target/
+/priv/native/
+
 # Where third-party dependencies like ExDoc output generated docs.
 /doc/
 

@@ -213,7 +213,7 @@ end
 
 defmodule Temporalex.Core.Command.ContinueAsNew do
   @moduledoc false
-  defstruct [:args]
+  defstruct [:args, :workflow_type, :task_queue]
 end
 
 defmodule Temporalex.Core.Command.CancelWorkflow do

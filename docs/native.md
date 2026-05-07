@@ -1,6 +1,6 @@
 # Native Backend
 
-The native backend is the future implementation of `Temporalex.Backend` using Rustler and Temporal Core.
+The native backend is the Rustler and Temporal Core implementation of `Temporalex.Backend`.
 
 This is an outer layer. It should not be built before the core executor/runner protocol and replay tests are solid.
 
@@ -80,11 +80,11 @@ The server should never call a per-poll NIF.
 
 ## Process Monitoring
 
-`WorkerResource` monitors the owning server process. When the server dies, the Rustler resource monitor fires and calls `worker.initiate_shutdown()`.
+`WorkerResource` monitors the owning server process. When the server dies, the Rustler resource monitor fires and schedules `worker.initiate_shutdown()` on the stored Tokio runtime handle. This matters because Temporal Core shutdown uses Tokio APIs internally and must not be called directly from a BEAM scheduler thread.
 
 This handles cases where Elixir `terminate/2` is skipped, including `Process.exit(pid, :kill)`.
 
-`WorkerResource::drop` should also call `initiate_shutdown()` as a safety net.
+`WorkerResource::drop` also schedules `initiate_shutdown()` as a safety net.
 
 ## NIF Interface
 

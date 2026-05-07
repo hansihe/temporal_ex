@@ -1,6 +1,6 @@
 # Temporalex SDK Overview
 
-Temporalex is an experimental Elixir SDK for Temporal. The SDK is built around a deterministic Elixir workflow core and a backend boundary that can later be implemented by Temporal Core via Rustler.
+Temporalex is an experimental Elixir SDK for Temporal. The SDK is built around a deterministic Elixir workflow core and a backend boundary implemented for Temporal Core via Rustler.
 
 This document is the architecture map. Detailed contracts live in focused docs:
 
@@ -10,7 +10,7 @@ This document is the architecture map. Detailed contracts live in focused docs:
 | [public_api.md](public_api.md) | Public module-level API: workflow DSL, activity DSL, client API shape, retry policy, and error structs. |
 | [implementation_principles.md](implementation_principles.md) | Internal implementation rules, invariants, API admission criteria, and review checklist. |
 | [implementation_slice.md](implementation_slice.md) | Core implementation slices: sequential core first, then structured concurrency with `parallel`, `phase`, signals, updates, and queries. |
-| [review_gates.md](review_gates.md) | Completed Slice 1 and Slice 2 review-gate notes, evidence, outcomes, and alpha limits. |
+| [review_gates.md](review_gates.md) | Completed Slice 1, Slice 2, and native integration review-gate notes, evidence, outcomes, and beta limits. |
 | [core.md](core.md) | Deterministic executor/runner kernel, internal structs, replay rules, scheduling, and invariants. |
 | [scheduler_and_replay.md](scheduler_and_replay.md) | Deterministic scheduler rounds, pause points, activation turns, command decisions, and replay matching. |
 | [core_testing.md](core_testing.md) | Test harness and test strategy for validating the core without Temporal or Rustler. |
@@ -91,7 +91,7 @@ See [core.md](core.md) and [temporal_core_mapping.md](temporal_core_mapping.md).
 
 The server is parameterized by a backend module. A backend starts workers, delivers core activations to the server, and accepts core completions from the server.
 
-The real backend, `Temporalex.Backend.TemporalCore`, will handle:
+The real backend, `Temporalex.Backend.TemporalCore`, handles:
 
 - Rustler calls
 - Temporal Core worker lifecycle
@@ -106,7 +106,7 @@ See [backend.md](backend.md) and [temporal_core_mapping.md](temporal_core_mappin
 
 ## Supervision Overview
 
-The library application eventually owns a singleton runtime process:
+The current native backend creates a Temporal Core runtime resource for each worker backend state. The library can later move that into a singleton runtime process:
 
 ```
 Temporalex.Supervisor
@@ -167,5 +167,5 @@ Current repository status:
 - Core verification lives in `test/temporalex/core_executor_test.exs` and covers sequential execution, replay matching, deterministic `parallel`, `phase`, signals, updates, queries, and process lifecycle.
 - Server/test-backend integration is implemented through `Temporalex.Worker`, `Temporalex.Server`, `Temporalex.Backend`, and `Temporalex.Backend.Test`.
 - Server verification lives in `test/temporalex/server_integration_test.exs` and covers worker supervision, executor registry cleanup, activation routing, activity task supervision, query routing, eviction, and completion submission.
-- `Temporalex.Backend.TemporalCore` is an explicit placeholder that fails until the native Temporal Core/Rustler and protobuf bridge is implemented.
-- Client APIs remain intentionally out of scope for this alpha surface.
+- `Temporalex.Backend.TemporalCore` is implemented through `Temporalex.Native`, Rustler resources, Temporal Core worker/client calls, native poll loops, protobuf conversion, and ETF payload conversion.
+- `Temporalex.Client.start_workflow/4` and `Temporalex.Client.get_result/2` are implemented for Temporal Core-backed workers. Signal, update, query, cancel, and terminate client calls remain future client API work.

@@ -70,10 +70,25 @@ defmodule Temporalex.BackendConformanceTest do
     assert_receive {:temporalex_test_backend, :activity_completion, ^completion}
   end
 
-  test "TemporalCore backend fails explicitly until native bridge exists" do
-    assert {:error, {:not_implemented, message}} =
-             Temporalex.Backend.TemporalCore.start_worker([], self())
+  test "TemporalCore codec encodes core completions without leaking native resources" do
+    assert {:ok, workflow_bytes} =
+             Temporalex.Backend.TemporalCore.Codec.workflow_completion_to_bytes(
+               %Completion{
+                 run_id: "run-codec",
+                 status: {:ok, [%Command.StartTimer{seq: 0, duration_ms: 10}]}
+               },
+               task_queue: "temporalex-test"
+             )
 
-    assert message =~ "Temporal Core/Rustler"
+    assert is_binary(workflow_bytes)
+    assert byte_size(workflow_bytes) > 0
+
+    assert {:ok, activity_bytes} =
+             Temporalex.Backend.TemporalCore.Codec.activity_completion_to_bytes(
+               %ActivityCompletion{task_token: <<1, 2, 3>>, result: {:ok, :done}}
+             )
+
+    assert is_binary(activity_bytes)
+    assert byte_size(activity_bytes) > 0
   end
 end

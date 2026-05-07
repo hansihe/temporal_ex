@@ -17,11 +17,19 @@ Reviewed implementation:
 - `Temporalex.Server`
 - `Temporalex.Backend`
 - `Temporalex.Backend.Test`
+- `Temporalex.Backend.TemporalCore`
+- `Temporalex.Backend.TemporalCore.Codec`
+- `Temporalex.Backend.TemporalCore.PayloadConverter`
+- `Temporalex.Native`
+- `Temporalex.Client`
+- `native/temporalex_nif`
 
 Test evidence:
 
-- `mix test`: 47 tests, 0 failures, 1 external test excluded.
-- `mix test --only external`: 1 test, 0 failures.
+- `CARGO_HOME=$(pwd)/.cargo-home cargo check --manifest-path native/temporalex_nif/Cargo.toml`: success.
+- `CARGO_HOME=$(pwd)/.cargo-home mix compile`: success.
+- `CARGO_HOME=$(pwd)/.cargo-home mix test --exclude external`: 47 tests, 0 failures, 2 external tests excluded.
+- `CARGO_HOME=$(pwd)/.cargo-home mix test --only external`: 2 tests, 0 failures.
 
 ## Slice 1 Review
 
@@ -35,7 +43,7 @@ Findings:
 - Activation failure and workflow failure are distinct in code and tests. Nondeterminism and scheduler violations produce `%Temporalex.Core.Completion{status: {:failed, reason, opts}}`; application workflow failures produce `%Temporalex.Core.Command.FailWorkflow{}` inside successful completions.
 - Runner lifecycle is executor-owned. Runners are linked to the executor, the executor traps exits, blocked runners remain alive, eviction tears down cached threads, and executor shutdown tears down linked runners.
 - The test harness drives the same `%Temporalex.Core.Activation{}` and `%Temporalex.Core.Completion{}` structs used by the server/backend boundary.
-- The implemented activation, job, command, and completion structs follow the documented Temporal Core mapping for the current alpha scope.
+- The implemented activation, job, command, and completion structs follow the documented Temporal Core mapping for the current core-slice scope.
 
 Outcome:
 
@@ -57,19 +65,36 @@ Findings:
 - Update validation respects `run_validator`; replay-style updates with `run_validator: false` skip validator execution and still emit accepted/completed responses.
 - Replay mismatch tests cover root commands, branch command order, and handler command changes.
 - Handler, branch, query, update, and workflow failures map to the documented failure surfaces covered by the core tests.
-- Process teardown covers root runners, blocked calls, phase exit, async handlers, executor shutdown, and eviction for the implemented alpha scope.
+- Process teardown covers root runners, blocked calls, phase exit, async handlers, executor shutdown, and eviction for the implemented core-slice scope.
 - The server/backend integration reuses the same core structs, and backend conformance tests now exercise the stable boundary with `Temporalex.Backend.Test`.
 
 Outcome:
 
-- No scheduler, replay, phase, update, or query ambiguity is known that blocks alpha evaluation.
+- No scheduler, replay, phase, update, or query ambiguity is known that blocks native backend integration.
 - Server/backend integration can proceed without changing executor scheduling semantics. The server implementation already routes, supervises, and submits without owning deterministic workflow state.
 
-## Alpha Limits
+## Native Integration Review
 
-These are known alpha limits, not review-gate blockers:
+Status: completed.
 
-- `Temporalex.Backend.TemporalCore` is a placeholder until the native Temporal Core/Rustler bridge and protobuf codecs are implemented.
-- The external Temporal CLI test starts and health-checks a local development server, but no end-to-end workflow is run against Temporal Server until the native backend exists.
-- Client APIs are not implemented.
-- Patch/version APIs, deterministic random helpers, UUID helpers, child workflows, local activities, and Nexus operations are outside the implemented alpha scope.
+Findings:
+
+- The server-facing backend boundary still uses core structs for activations, activity tasks, workflow completions, and activity completions. Protobuf structs and Rustler resources stay inside `Temporalex.Backend.TemporalCore`, `Temporalex.Native`, and the native crate.
+- The native NIF interface follows the documented async pattern. `create_runtime/0` is synchronous; connect, worker start, completion submission, shutdown, and client workflow operations return quickly and send tagged messages back to Elixir.
+- Rust owns the long-lived poll loops. The server receives `{:workflow_activation, %Activation{}}` and `{:activity_task, %ActivityTask{}}`; it does not call per-poll NIFs.
+- Completion submission is asynchronous and failure-bearing. The server handles `{:workflow_completion, :ok | {:error, reason}}` and `{:activity_completion, :ok | {:error, reason}}` messages as fatal backend submission failures when needed.
+- Activity heartbeats flow from `Temporalex.Activity.Context.heartbeat/2` through `Temporalex.Server.record_activity_heartbeat/3` to the backend, where details are encoded as ETF payload bytes and submitted through Temporal Core.
+- Worker shutdown is covered by explicit server termination, the Rustler resource monitor, and resource drop. Shutdown initiation is scheduled on the Temporal Core Tokio runtime handle rather than called directly from BEAM scheduler threads.
+- The minimal client path starts workflows and awaits workflow results through the Temporal Core connection kept in backend state.
+- `test/temporalex/integration/temporal_core_integration_test.exs` verifies a real Temporal dev-server run covering client start, worker polling, timer command/resolution, activity task execution, heartbeat submission, activity completion, workflow completion, and result decoding.
+
+Outcome:
+
+- No native/backend boundary shortcut is known that blocks beta evaluation of workflow start/result, worker polling, timers, activities, heartbeats, completions, shutdown, and ETF payload conversion.
+
+## Beta Limits
+
+These are known beta limits, not review-gate blockers for the implemented native execution path:
+
+- Client APIs beyond workflow start/result are not implemented yet.
+- Patch/version APIs, deterministic random helpers, UUID helpers, child workflows, local activities, and Nexus operations are outside the implemented beta scope.

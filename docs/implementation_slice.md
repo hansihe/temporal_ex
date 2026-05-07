@@ -14,9 +14,11 @@ The repository has implemented the core through Slice 2 and the first server/bac
 - `test/temporalex/core_executor_test.exs` verifies the mandatory Slice 1 and Slice 2 scenarios that are in scope for the core.
 - `Temporalex.Worker`, `Temporalex.Server`, `Temporalex.Backend`, and `Temporalex.Backend.Test` implement the server/test-backend phase after the core slices.
 - `test/temporalex/server_integration_test.exs` and `test/temporalex/backend_conformance_test.exs` verify worker supervision, activation routing, executor registry cleanup, activity task supervision, completion submission, and the backend behaviour contract.
+- `Temporalex.Backend.TemporalCore`, `Temporalex.Native`, and the Rust crate in `native/temporalex_nif` implement the real Temporal Core/Rustler backend with native poll loops, protobuf conversion, ETF payloads, async completion submission, heartbeats, shutdown, and minimal client start/result operations.
+- `test/temporalex/integration/temporal_core_integration_test.exs` starts a Temporal dev server and verifies an end-to-end workflow through the Rust NIF and Temporal Core.
 - Slice 1 and Slice 2 review gates are complete and recorded in [review_gates.md](review_gates.md).
 
-The next implementation work should start the native Temporal Core/Rustler bridge or client-facing APIs. Server/backend routing should not change executor scheduling semantics.
+The next implementation work should focus on remaining client-facing operations, public error polish, packaging, and broader production hardening. Server/backend routing should not change executor scheduling semantics.
 
 ## Slice 1: Sequential Core
 
@@ -436,8 +438,9 @@ The next work should be server/backend integration, not new workflow semantics:
 3. [x] Test backend that delivers core structs and captures completions.
 4. [x] Server-to-executor activation routing.
 5. [x] Activity task supervision and activity completion submission.
-6. [x] Backend conformance tests for the stable backend behaviour, currently exercised by the test backend with the real backend represented by an explicit placeholder.
-7. [ ] Temporal Core/Rustler backend that translates protobuf/Core messages into the same core structs.
+6. [x] Backend conformance tests for the stable backend behaviour, exercised by the test backend and native codec checks.
+7. [x] Temporal Core/Rustler backend that translates protobuf/Core messages into the same core structs.
+8. [x] External integration test against `temporal server start-dev` covering worker polling, timers, activity execution, heartbeats, workflow completion, client start, and result retrieval.
 
 The rule for this phase:
 

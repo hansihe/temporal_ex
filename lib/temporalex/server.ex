@@ -45,6 +45,12 @@ defmodule Temporalex.Server do
     GenServer.call(server, :backend_state)
   end
 
+  def record_activity_heartbeat(server, task_token, details) when is_binary(task_token) do
+    server
+    |> Temporalex.Worker.server_pid()
+    |> GenServer.call({:record_activity_heartbeat, task_token, details}, :infinity)
+  end
+
   def snapshot(server) do
     GenServer.call(server, :snapshot)
   end
@@ -76,6 +82,11 @@ defmodule Temporalex.Server do
   @impl GenServer
   def handle_call(:backend_state, _from, state) do
     {:reply, state.backend_state, state}
+  end
+
+  def handle_call({:record_activity_heartbeat, task_token, details}, _from, state) do
+    result = state.backend.record_activity_heartbeat(state.backend_state, task_token, details)
+    {:reply, result, state}
   end
 
   def handle_call(:snapshot, _from, state) do
@@ -110,6 +121,28 @@ defmodule Temporalex.Server do
 
   def handle_info({:backend_error, reason}, state) do
     {:stop, {:backend_error, reason}, state}
+  end
+
+  def handle_info({:workflow_completion, :ok}, state), do: {:noreply, state}
+
+  def handle_info({:workflow_completion, {:error, reason}}, state) do
+    {:stop, {:backend_workflow_completion_failed, reason}, state}
+  end
+
+  def handle_info({:activity_completion, :ok}, state), do: {:noreply, state}
+
+  def handle_info({:activity_completion, {:error, reason}}, state) do
+    {:stop, {:backend_activity_completion_failed, reason}, state}
+  end
+
+  def handle_info({:poll_loop_exited, kind, :shutdown}, state)
+      when kind in [:workflow, :activity] do
+    {:stop, {:backend_worker_shutdown, {kind, :shutdown}}, state}
+  end
+
+  def handle_info({:poll_loop_exited, kind, :crashed}, state)
+      when kind in [:workflow, :activity] do
+    {:stop, {:backend_error, {:poll_loop_exited, kind, :crashed}}, state}
   end
 
   def handle_info({:backend_worker_shutdown, reason}, state) do

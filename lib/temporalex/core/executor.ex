@@ -885,7 +885,7 @@ defmodule Temporalex.Core.Executor do
   end
 
   defp complete_root_thread(state, {:continue_as_new, args}) do
-    append_command(state, %Command.ContinueAsNew{args: args})
+    append_command(state, %Command.ContinueAsNew{args: args, workflow_type: state.workflow_type})
   end
 
   defp complete_root_thread(state, other) do
