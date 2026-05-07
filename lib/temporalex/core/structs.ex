@@ -236,6 +236,36 @@ defmodule Temporalex.Core.Command.UpsertSearchAttributes do
   defstruct attrs: %{}
 end
 
+defmodule Temporalex.Core.ActivityTask do
+  @moduledoc """
+  Server-facing activity task decoded by a backend.
+  """
+
+  defstruct task_token: nil,
+            activity_id: nil,
+            activity_type: nil,
+            workflow_id: nil,
+            run_id: nil,
+            workflow_type: nil,
+            namespace: nil,
+            task_queue: nil,
+            input: [],
+            attempt: 1,
+            heartbeat_timeout: nil,
+            is_local: false,
+            headers: %{},
+            variant: :start,
+            cancel_reason: nil
+end
+
+defmodule Temporalex.Core.ActivityCompletion do
+  @moduledoc """
+  Server-facing activity completion submitted through a backend.
+  """
+
+  defstruct task_token: nil, result: nil
+end
+
 defmodule Temporalex.Core.Op.ExecuteActivity do
   @moduledoc false
   defstruct [:type, input: [], opts: []]
