@@ -159,3 +159,9 @@ The authoritative implementation plan is [implementation_slice.md](implementatio
 6. Real Temporal backend with Rustler, Temporal Core, and protobuf conversion.
 
 The outer layers should not be built until the core slices and review gates are complete.
+
+Current repository status:
+
+- Slice 1 and Slice 2 core behavior are implemented in `lib/temporalex/core/*`, `lib/temporalex/workflow/*`, and `lib/temporalex/activity.ex`.
+- Core verification lives in `test/temporalex/core_executor_test.exs` and covers sequential execution, replay matching, deterministic `parallel`, `phase`, signals, updates, queries, and process lifecycle.
+- Server, backend, activity worker supervision, Rustler, protobuf conversion, and client APIs remain intentionally out of scope for the next implementation phase.

@@ -147,6 +147,16 @@ defmodule Temporalex.CoreExecutorTest do
     end
   end
 
+  defmodule WaitSignalWorkflow do
+    use Temporalex.Workflow
+
+    def run(_) do
+      first = API.wait_for_signal("go")
+      second = API.wait_for_signal("go")
+      {:ok, [first, second]}
+    end
+  end
+
   defmodule BufferedSignalWorkflow do
     use Temporalex.Workflow
 
@@ -217,7 +227,8 @@ defmodule Temporalex.CoreExecutorTest do
             "add" =>
               {fn [amount], state ->
                  {:reply, state + amount, state + amount}
-               end, validator: fn
+               end,
+               validator: fn
                  [amount], _state when amount > 0 -> :ok
                  _args, _state -> {:error, :invalid_amount}
                end},
@@ -231,6 +242,37 @@ defmodule Temporalex.CoreExecutorTest do
             "stop" => fn _args, state -> {:stop, :stopped, state} end
           },
           signal: %{"done" => fn _args, state -> {:stop, state} end}
+        )
+
+      {:ok, state}
+    end
+  end
+
+  defmodule AsyncUpdateWorkflow do
+    use Temporalex.Workflow
+
+    def run(_) do
+      state =
+        API.phase(0,
+          update: %{
+            "slow" => fn [amount], state ->
+              {:async,
+               fn ->
+                 :ok = API.sleep(10)
+                 API.update_state(fn current -> {current + amount, current + amount} end)
+               end, state}
+            end,
+            "bad_state" => fn _args, state ->
+              {:async,
+               fn ->
+                 API.update_state(fn current ->
+                   API.sleep(1)
+                   {:ok, current}
+                 end)
+               end, state}
+            end,
+            "stop" => fn _args, state -> {:stop, :stopped, state} end
+          }
         )
 
       {:ok, state}
@@ -290,10 +332,14 @@ defmodule Temporalex.CoreExecutorTest do
       assert {:continue_as_new, [:next]} = TestHarness.next(exec)
 
       assert {:ok, exec} = TestHarness.start_workflow(UnsupportedReturnWorkflow, :ignored)
-      assert {:complete, {:error, {:unsupported_workflow_return, :bad_return}}} = TestHarness.next(exec)
+
+      assert {:complete, {:error, {:unsupported_workflow_return, :bad_return}}} =
+               TestHarness.next(exec)
 
       assert {:ok, exec} = TestHarness.start_workflow(RaisingWorkflow, :ignored)
-      assert {:complete, {:error, {:exception, {:exception, %RuntimeError{}, _stack}}}} = TestHarness.next(exec)
+
+      assert {:complete, {:error, {:exception, {:exception, %RuntimeError{}, _stack}}}} =
+               TestHarness.next(exec)
     end
 
     test "activity commands block and resume by sequence number" do
@@ -307,7 +353,40 @@ defmodule Temporalex.CoreExecutorTest do
       assert command.input == [:value]
 
       assert {:complete, {:ok, :result}} =
-               TestHarness.resolve(exec, %Job.ActivityResolved{seq: command.seq, result: {:ok, :result}})
+               TestHarness.resolve(exec, %Job.ActivityResolved{
+                 seq: command.seq,
+                 result: {:ok, :result}
+               })
+    end
+
+    test "blocked runner remains alive while waiting for activity resolution" do
+      assert {:ok, exec} = TestHarness.start_workflow(ActivityWorkflow, :value)
+      assert {:yield, [%Command.ScheduleActivity{}]} = TestHarness.next(exec)
+
+      state = Temporalex.Core.Executor.inspect_state(exec.pid)
+      runner = state.threads[[]]
+
+      assert runner.status == :blocked
+      assert Process.alive?(runner.pid)
+    end
+
+    test "executor shutdown tears down linked blocked runner" do
+      previous_flag = Process.flag(:trap_exit, true)
+
+      try do
+        assert {:ok, exec} = TestHarness.start_workflow(ActivityWorkflow, :value)
+        assert {:yield, [%Command.ScheduleActivity{}]} = TestHarness.next(exec)
+
+        runner_pid = Temporalex.Core.Executor.inspect_state(exec.pid).threads[[]].pid
+        assert Process.alive?(runner_pid)
+
+        Process.exit(exec.pid, :shutdown)
+        assert_receive {:EXIT, pid, :shutdown} when pid == exec.pid
+
+        refute Process.alive?(runner_pid)
+      after
+        Process.flag(:trap_exit, previous_flag)
+      end
     end
 
     test "activity failures are workflow-visible values" do
@@ -315,7 +394,10 @@ defmodule Temporalex.CoreExecutorTest do
       assert {:yield, [%Command.ScheduleActivity{} = command]} = TestHarness.next(exec)
 
       assert {:complete, {:ok, {:error, :activity_failed}}} =
-               TestHarness.resolve(exec, %Job.ActivityResolved{seq: command.seq, result: {:error, :activity_failed}})
+               TestHarness.resolve(exec, %Job.ActivityResolved{
+                 seq: command.seq,
+                 result: {:error, :activity_failed}
+               })
     end
 
     test "timer commands block and resume by sequence number" do
@@ -326,7 +408,8 @@ defmodule Temporalex.CoreExecutorTest do
       assert command.thread_id == []
       assert command.duration_ms == 25
 
-      assert {:complete, {:ok, :slept}} = TestHarness.resolve(exec, %Job.TimerFired{seq: command.seq})
+      assert {:complete, {:ok, :slept}} =
+               TestHarness.resolve(exec, %Job.TimerFired{seq: command.seq})
     end
 
     test "activity followed by timer keeps monotonic command sequence" do
@@ -334,13 +417,18 @@ defmodule Temporalex.CoreExecutorTest do
       assert {:yield, [%Command.ScheduleActivity{seq: 0} = activity]} = TestHarness.next(exec)
 
       assert {:yield, [%Command.StartTimer{seq: 1} = timer]} =
-               TestHarness.resolve(exec, %Job.ActivityResolved{seq: activity.seq, result: {:ok, :value}})
+               TestHarness.resolve(exec, %Job.ActivityResolved{
+                 seq: activity.seq,
+                 result: {:ok, :value}
+               })
 
-      assert {:complete, {:ok, :done}} = TestHarness.resolve(exec, %Job.TimerFired{seq: timer.seq})
+      assert {:complete, {:ok, :done}} =
+               TestHarness.resolve(exec, %Job.TimerFired{seq: timer.seq})
     end
 
     test "workflow info, cancellation, and activation time are executor-owned" do
-      assert {:ok, exec} = TestHarness.start_workflow(InfoWorkflow, nil, timestamp: ~U[2026-05-07 12:00:00Z])
+      assert {:ok, exec} =
+               TestHarness.start_workflow(InfoWorkflow, nil, timestamp: ~U[2026-05-07 12:00:00Z])
 
       assert {:complete, {:ok, result}} =
                TestHarness.activate(exec, [
@@ -386,11 +474,39 @@ defmodule Temporalex.CoreExecutorTest do
       ]
 
       assert {:ok, exec} = TestHarness.start_workflow(ActivityWorkflow, :value)
-      assert {:yield, expected} == TestHarness.next(exec, replay: true, expected_commands: expected)
+
+      assert {:yield, expected} ==
+               TestHarness.next(exec, replay: true, expected_commands: expected)
 
       wrong = [%Command.StartTimer{seq: 0, thread_id: [], duration_ms: 10}]
       assert {:ok, exec} = TestHarness.start_workflow(ActivityWorkflow, :value)
-      assert {:failed, %Nondeterminism{}} = TestHarness.next(exec, replay: true, expected_commands: wrong)
+
+      assert {:failed, %Nondeterminism{}} =
+               TestHarness.next(exec, replay: true, expected_commands: wrong)
+
+      assert {:ok, exec} = TestHarness.start_workflow(ActivityWorkflow, :value)
+
+      assert {:failed, %Nondeterminism{}} =
+               TestHarness.next(exec, replay: true, expected_commands: [])
+
+      assert {:ok, exec} = TestHarness.start_workflow(ActivityWorkflow, :value)
+
+      assert {:failed, %Nondeterminism{}} =
+               TestHarness.next(exec,
+                 replay: true,
+                 expected_commands:
+                   expected ++ [%Command.StartTimer{seq: 1, thread_id: [], duration_ms: 1}]
+               )
+    end
+
+    test "test harness can record and replay a command transcript" do
+      assert {:ok, transcript, :done} =
+               TestHarness.record(ActivityThenTimerWorkflow, :value, fn
+                 %Command.ScheduleActivity{} -> {:ok, :value}
+               end)
+
+      assert {:ok, {:ok, :done}} =
+               TestHarness.replay(ActivityThenTimerWorkflow, :value, transcript)
     end
   end
 
@@ -443,7 +559,9 @@ defmodule Temporalex.CoreExecutorTest do
 
     test "parallel returns results in input order after every branch finishes" do
       assert {:ok, exec} = TestHarness.start_workflow(ParallelWorkflow, nil)
-      assert {:yield, [%Command.ScheduleActivity{seq: a1}, %Command.ScheduleActivity{seq: b1}]} = TestHarness.next(exec)
+
+      assert {:yield, [%Command.ScheduleActivity{seq: a1}, %Command.ScheduleActivity{seq: b1}]} =
+               TestHarness.next(exec)
 
       assert {:yield, [%Command.ScheduleActivity{seq: a2}, %Command.ScheduleActivity{seq: b2}]} =
                TestHarness.resolve(exec, [
@@ -487,7 +605,10 @@ defmodule Temporalex.CoreExecutorTest do
       assert {:yield, []} = TestHarness.send_signal(exec, "inc", [2])
 
       assert {:waiting, %{state: 2}} =
-               TestHarness.resolve(exec, %Job.ActivityResolved{seq: gate_seq, result: {:ok, :gate}})
+               TestHarness.resolve(exec, %Job.ActivityResolved{
+                 seq: gate_seq,
+                 result: {:ok, :gate}
+               })
 
       assert {:complete, {:ok, 2}} = TestHarness.send_signal(exec, "done", [])
     end
@@ -502,6 +623,25 @@ defmodule Temporalex.CoreExecutorTest do
       assert [%Job.SignalReceived{name: "other", args: [:value]}] = state.signal_buffer
     end
 
+    test "wait_for_signal consumes buffered signals in arrival order" do
+      assert {:ok, exec} = TestHarness.start_workflow(WaitSignalWorkflow, nil)
+
+      completion =
+        TestHarness.activate_raw(exec, [
+          %Job.SignalReceived{name: "go", args: [:first]},
+          %Job.SignalReceived{name: "go", args: [:second]},
+          %Job.InitializeWorkflow{
+            workflow_type: inspect(WaitSignalWorkflow),
+            workflow_id: "wf-wait",
+            arguments: [nil],
+            workflow_info: %{},
+            randomness_seed: 0
+          }
+        ])
+
+      assert {:ok, [%Command.CompleteWorkflow{result: [[:first], [:second]]}]} = completion.status
+    end
+
     test "sync signal handlers serialize message processing" do
       assert {:ok, exec} = TestHarness.start_workflow(SyncSignalWorkflow, nil)
       assert {:waiting, _info} = TestHarness.next(exec)
@@ -513,10 +653,16 @@ defmodule Temporalex.CoreExecutorTest do
                ])
 
       assert {:yield, [%Command.ScheduleActivity{seq: second_seq, input: [:second]}]} =
-               TestHarness.resolve(exec, %Job.ActivityResolved{seq: first_seq, result: {:ok, :first}})
+               TestHarness.resolve(exec, %Job.ActivityResolved{
+                 seq: first_seq,
+                 result: {:ok, :first}
+               })
 
       assert {:waiting, %{state: [:first, :second]}} =
-               TestHarness.resolve(exec, %Job.ActivityResolved{seq: second_seq, result: {:ok, :second}})
+               TestHarness.resolve(exec, %Job.ActivityResolved{
+                 seq: second_seq,
+                 result: {:ok, :second}
+               })
     end
 
     test "async signal handler can block while phase dispatches later messages" do
@@ -543,23 +689,78 @@ defmodule Temporalex.CoreExecutorTest do
               ]} =
                TestHarness.send_update(exec, "activity", [], protocol_instance_id: "p1")
 
-      assert {:yield, [%Command.RespondToUpdate{protocol_instance_id: "p1", response: {:completed, :activity_done}}]} =
-               TestHarness.resolve(exec, %Job.ActivityResolved{seq: activity_seq, result: {:ok, :activity_done}})
+      assert {:yield,
+              [
+                %Command.RespondToUpdate{
+                  protocol_instance_id: "p1",
+                  response: {:completed, :activity_done}
+                }
+              ]} =
+               TestHarness.resolve(exec, %Job.ActivityResolved{
+                 seq: activity_seq,
+                 result: {:ok, :activity_done}
+               })
+    end
+
+    test "async update handler accepts before work and completes after its durable wait" do
+      assert {:ok, exec} = TestHarness.start_workflow(AsyncUpdateWorkflow, nil)
+      assert {:waiting, _info} = TestHarness.next(exec)
+
+      assert {:yield,
+              [
+                %Command.RespondToUpdate{protocol_instance_id: "async", response: :accepted},
+                %Command.StartTimer{seq: timer_seq, thread_id: [{:h, 0}, {:a, 0}]}
+              ]} =
+               TestHarness.send_update(exec, "slow", [3], protocol_instance_id: "async")
+
+      assert {:yield,
+              [%Command.RespondToUpdate{protocol_instance_id: "async", response: {:completed, 3}}]} =
+               TestHarness.resolve(exec, %Job.TimerFired{seq: timer_seq})
+
+      assert {:complete, {:ok, 3}} =
+               TestHarness.send_update(exec, "stop", [], protocol_instance_id: "stop")
+    end
+
+    test "update_state closures that call workflow APIs fail the async update" do
+      assert {:ok, exec} = TestHarness.start_workflow(AsyncUpdateWorkflow, nil)
+      assert {:waiting, _info} = TestHarness.next(exec)
+
+      assert {:yield,
+              [
+                %Command.RespondToUpdate{protocol_instance_id: "bad-state", response: :accepted},
+                %Command.RespondToUpdate{
+                  protocol_instance_id: "bad-state",
+                  response: {:rejected, {:exception, %RuntimeError{}, _stack}}
+                }
+              ]} =
+               TestHarness.send_update(exec, "bad_state", [], protocol_instance_id: "bad-state")
     end
 
     test "update validators reject invalid updates and run_validator false skips validation" do
       assert {:ok, exec} = TestHarness.start_workflow(UpdateWorkflow, nil)
       assert {:waiting, _info} = TestHarness.next(exec)
 
-      assert {:yield, [%Command.RespondToUpdate{protocol_instance_id: "bad", response: {:rejected, :invalid_amount}}]} =
+      assert {:yield,
+              [
+                %Command.RespondToUpdate{
+                  protocol_instance_id: "bad",
+                  response: {:rejected, :invalid_amount}
+                }
+              ]} =
                TestHarness.send_update(exec, "add", [-1], protocol_instance_id: "bad")
 
       assert {:yield,
               [
                 %Command.RespondToUpdate{protocol_instance_id: "skip", response: :accepted},
-                %Command.RespondToUpdate{protocol_instance_id: "skip", response: {:completed, :validator_skipped}}
+                %Command.RespondToUpdate{
+                  protocol_instance_id: "skip",
+                  response: {:completed, :validator_skipped}
+                }
               ]} =
-               TestHarness.send_update(exec, "skip_validator", [], protocol_instance_id: "skip", run_validator: false)
+               TestHarness.send_update(exec, "skip_validator", [],
+                 protocol_instance_id: "skip",
+                 run_validator: false
+               )
     end
 
     test "updates outside matching phase are rejected" do
@@ -594,9 +795,12 @@ defmodule Temporalex.CoreExecutorTest do
 
     test "phase timeout uses durable timer and returns timeout tuple" do
       assert {:ok, exec} = TestHarness.start_workflow(TimeoutPhaseWorkflow, nil)
-      assert {:yield, [%Command.StartTimer{seq: timeout_seq, duration_ms: 50}]} = TestHarness.next(exec)
 
-      assert {:complete, {:ok, {:timeout, :open}}} = TestHarness.resolve(exec, %Job.TimerFired{seq: timeout_seq})
+      assert {:yield, [%Command.StartTimer{seq: timeout_seq, duration_ms: 50}]} =
+               TestHarness.next(exec)
+
+      assert {:complete, {:ok, {:timeout, :open}}} =
+               TestHarness.resolve(exec, %Job.TimerFired{seq: timeout_seq})
     end
 
     test "phase stop before timeout emits CancelTimer" do
@@ -620,18 +824,25 @@ defmodule Temporalex.CoreExecutorTest do
       assert {:ok, exec} = TestHarness.start_workflow(QueryWorkflow, nil)
       assert {:yield, [%Command.ScheduleActivity{seq: activity_seq}]} = TestHarness.next(exec)
 
-      assert {:yield, [%Command.RespondToQuery{query_id: "q1", result: {:ok, %{step: :before_activity}}}]} =
+      assert {:yield,
+              [%Command.RespondToQuery{query_id: "q1", result: {:ok, %{step: :before_activity}}}]} =
                TestHarness.query(exec, "state", [], query_id: "q1")
 
       assert %{[] => :blocked} = TestHarness.thread_states(exec)
-      assert {:complete, {:ok, :done}} = TestHarness.resolve(exec, %Job.ActivityResolved{seq: activity_seq, result: {:ok, :activity}})
+
+      assert {:complete, {:ok, :done}} =
+               TestHarness.resolve(exec, %Job.ActivityResolved{
+                 seq: activity_seq,
+                 result: {:ok, :activity}
+               })
     end
 
     test "query failures become query responses instead of workflow failures" do
       assert {:ok, exec} = TestHarness.start_workflow(BadQueryWorkflow, nil)
       assert {:complete, {:ok, :done}} = TestHarness.next(exec)
 
-      assert {:yield, [%Command.RespondToQuery{query_id: "bad", result: {:error, %RuntimeError{}}}]} =
+      assert {:yield,
+              [%Command.RespondToQuery{query_id: "bad", result: {:error, %RuntimeError{}}}]} =
                TestHarness.query(exec, "bad", [], query_id: "bad")
     end
   end
@@ -650,7 +861,9 @@ defmodule Temporalex.CoreExecutorTest do
       ]
 
       assert {:ok, exec} = TestHarness.start_workflow(ParallelWorkflow, nil)
-      assert {:failed, %Nondeterminism{}} = TestHarness.next(exec, replay: true, expected_commands: wrong)
+
+      assert {:failed, %Nondeterminism{}} =
+               TestHarness.next(exec, replay: true, expected_commands: wrong)
     end
 
     test "handler command mismatch fails activation nondeterministically" do
@@ -663,7 +876,11 @@ defmodule Temporalex.CoreExecutorTest do
       ]
 
       assert {:failed, %Nondeterminism{}} =
-               TestHarness.send_update(exec, "activity", [], protocol_instance_id: "p1", replay: true, expected_commands: wrong)
+               TestHarness.send_update(exec, "activity", [],
+                 protocol_instance_id: "p1",
+                 replay: true,
+                 expected_commands: wrong
+               )
     end
   end
 end

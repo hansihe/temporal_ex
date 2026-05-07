@@ -4,6 +4,17 @@ This document defines the first implementation slices. They are intentionally co
 
 Use this with [implementation_principles.md](implementation_principles.md), [core.md](core.md), [scheduler_and_replay.md](scheduler_and_replay.md), and [core_testing.md](core_testing.md).
 
+## Current Status
+
+The repository has implemented the core through Slice 2:
+
+- `Temporalex.Core.Executor` owns activation turns, scheduler rounds, replay matching, runner lifecycle, command sequencing, `parallel`, `phase`, signals, updates, and queries.
+- `Temporalex.Workflow.API`, `Temporalex.Workflow`, and `Temporalex.Activity` provide the core-facing public workflow and activity surface for these slices.
+- `Temporalex.Core.TestHarness` drives pure core activation transcripts and replay tests without server/backend/Rustler dependencies.
+- `test/temporalex/core_executor_test.exs` verifies the mandatory Slice 1 and Slice 2 scenarios that are in scope for the core.
+
+The next implementation work should follow the Slice 2 review gate below before moving outward to server/backend integration.
+
 ## Slice 1: Sequential Core
 
 Goal:

@@ -49,7 +49,16 @@ defmodule Temporalex.Workflow.API do
   end
 
   def update_state(fun) when is_function(fun, 1) do
-    call(%Op.UpdateState{fun: fun})
+    case call(%Op.UpdateState{fun: fun}) do
+      {:error, %{__exception__: true} = error} ->
+        raise error
+
+      {:error, reason} ->
+        raise "Temporalex.Workflow.API.update_state/1 failed: #{inspect(reason)}"
+
+      result ->
+        result
+    end
   end
 
   def random do

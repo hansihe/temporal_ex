@@ -33,7 +33,10 @@ defmodule Temporalex.Core.Nondeterminism do
   def exception(opts) do
     expected = Keyword.get(opts, :expected)
     actual = Keyword.get(opts, :actual)
-    reason = Keyword.get(opts, :message, "workflow command decisions diverged from replay history")
+
+    reason =
+      Keyword.get(opts, :message, "workflow command decisions diverged from replay history")
+
     %__MODULE__{message: reason, expected: expected, actual: actual}
   end
 end
@@ -51,7 +54,8 @@ defmodule Temporalex.Core.SchedulerViolation do
     running = Keyword.get(opts, :running)
 
     %__MODULE__{
-      message: "workflow thread #{inspect(thread_id)} called executor while #{inspect(running)} was running",
+      message:
+        "workflow thread #{inspect(thread_id)} called executor while #{inspect(running)} was running",
       thread_id: thread_id,
       running: running
     }
@@ -96,22 +100,24 @@ end
 defmodule Temporalex.Core.Phase do
   @moduledoc false
 
-  defstruct [:id,
-             :owner_thread_id,
-             :from,
-             :timeout_ms,
-             :timeout_seq,
-             state: nil,
-             signal_handlers: %{},
-             update_handlers: %{},
-             queue: :queue.new(),
-             active_dispatch: nil,
-             async_threads: MapSet.new(),
-             dispatch_counter: 0,
-             stopping?: false,
-             result: nil,
-             timeout_fired?: false,
-             timer_cancelled?: false]
+  defstruct [
+    :id,
+    :owner_thread_id,
+    :from,
+    :timeout_ms,
+    :timeout_seq,
+    state: nil,
+    signal_handlers: %{},
+    update_handlers: %{},
+    queue: :queue.new(),
+    active_dispatch: nil,
+    async_threads: MapSet.new(),
+    dispatch_counter: 0,
+    stopping?: false,
+    result: nil,
+    timeout_fired?: false,
+    timer_cancelled?: false
+  ]
 end
 
 defmodule Temporalex.Core.Job.InitializeWorkflow do

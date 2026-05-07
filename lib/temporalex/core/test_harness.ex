@@ -20,7 +20,8 @@ defmodule Temporalex.Core.TestHarness do
          workflow_module: workflow_module,
          input: input,
          run_id: run_id,
-         workflow_id: Keyword.get(opts, :workflow_id, "workflow-#{System.unique_integer([:positive])}"),
+         workflow_id:
+           Keyword.get(opts, :workflow_id, "workflow-#{System.unique_integer([:positive])}"),
          timestamp: Keyword.get(opts, :timestamp, ~U[2026-01-01 00:00:00Z])
        }}
     end
@@ -55,7 +56,8 @@ defmodule Temporalex.Core.TestHarness do
   def send_update(%__MODULE__{} = harness, name, args \\ [], opts \\ []) do
     update = %Job.UpdateReceived{
       id: Keyword.get(opts, :id, "update-#{System.unique_integer([:positive])}"),
-      protocol_instance_id: Keyword.get(opts, :protocol_instance_id, "protocol-#{System.unique_integer([:positive])}"),
+      protocol_instance_id:
+        Keyword.get(opts, :protocol_instance_id, "protocol-#{System.unique_integer([:positive])}"),
       name: name,
       args: List.wrap(args),
       headers: Keyword.get(opts, :headers, %{}),
@@ -91,13 +93,20 @@ defmodule Temporalex.Core.TestHarness do
       jobs: jobs
     }
 
-    Executor.activate(harness.pid, activation, expected_commands: Keyword.get(opts, :expected_commands))
+    Executor.activate(harness.pid, activation,
+      expected_commands: Keyword.get(opts, :expected_commands)
+    )
   end
 
   def commands(%__MODULE__{} = harness), do: Executor.inspect_state(harness.pid).commands
   def pending_calls(%__MODULE__{} = harness), do: Executor.inspect_state(harness.pid).pending
-  def published_state(%__MODULE__{} = harness), do: Executor.inspect_state(harness.pid).published_state
-  def phase_state(%__MODULE__{} = harness), do: Executor.inspect_state(harness.pid).phase && Executor.inspect_state(harness.pid).phase.state
+
+  def published_state(%__MODULE__{} = harness),
+    do: Executor.inspect_state(harness.pid).published_state
+
+  def phase_state(%__MODULE__{} = harness),
+    do:
+      Executor.inspect_state(harness.pid).phase && Executor.inspect_state(harness.pid).phase.state
 
   def thread_states(%__MODULE__{} = harness) do
     harness.pid

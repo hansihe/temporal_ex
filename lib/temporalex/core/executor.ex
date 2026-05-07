@@ -155,7 +155,9 @@ defmodule Temporalex.Core.Executor do
     %{state | commands: [], expected_commands: nil, expected_index: 0, activation_failed: nil}
   end
 
-  defp eviction_only?([%Job.RemoveFromCache{} | rest]), do: Enum.all?(rest, &match?(%Job.RemoveFromCache{}, &1))
+  defp eviction_only?([%Job.RemoveFromCache{} | rest]),
+    do: Enum.all?(rest, &match?(%Job.RemoveFromCache{}, &1))
+
   defp eviction_only?(_jobs), do: false
 
   defp query_only?(jobs) when jobs != [] do
@@ -232,7 +234,11 @@ defmodule Temporalex.Core.Executor do
         | workflow_id: init.workflow_id,
           workflow_type: workflow_type,
           arguments: args,
-          workflow_info: Map.merge(init.workflow_info || %{}, %{workflow_id: init.workflow_id, workflow_type: workflow_type}),
+          workflow_info:
+            Map.merge(init.workflow_info || %{}, %{
+              workflow_id: init.workflow_id,
+              workflow_type: workflow_type
+            }),
           randomness_seed: init.randomness_seed,
           initialized?: true
       }
@@ -247,7 +253,7 @@ defmodule Temporalex.Core.Executor do
     |> Map.put(:current_round, runnable)
     |> Map.put(:next_round, [])
     |> Map.put(:in_round?, true)
-     |> drain_rounds()
+    |> drain_rounds()
   end
 
   defp drain_scheduler(state), do: state
@@ -325,7 +331,9 @@ defmodule Temporalex.Core.Executor do
           if caller_thread_id == thread_id and state.running == thread_id do
             handle_workflow_op(state, from, caller_thread_id, op)
           else
-            violation = SchedulerViolation.exception(thread_id: caller_thread_id, running: state.running)
+            violation =
+              SchedulerViolation.exception(thread_id: caller_thread_id, running: state.running)
+
             GenServer.reply(from, {:error, violation})
             fail_activation(state, violation)
           end
@@ -360,7 +368,9 @@ defmodule Temporalex.Core.Executor do
         end
     after
       5_000 ->
-        fail_activation(state, %RuntimeError{message: "workflow thread #{inspect(thread_id)} did not yield"})
+        fail_activation(state, %RuntimeError{
+          message: "workflow thread #{inspect(thread_id)} did not yield"
+        })
     end
   end
 
@@ -403,7 +413,14 @@ defmodule Temporalex.Core.Executor do
 
       :error ->
         waiter = %{thread_id: thread_id, from: from, op: op}
-        signal_waiters = Map.update(state.signal_waiters, name, :queue.from_list([waiter]), &:queue.in(waiter, &1))
+
+        signal_waiters =
+          Map.update(
+            state.signal_waiters,
+            name,
+            :queue.from_list([waiter]),
+            &:queue.in(waiter, &1)
+          )
 
         state
         |> Map.put(:signal_waiters, signal_waiters)
@@ -470,7 +487,10 @@ defmodule Temporalex.Core.Executor do
     end)
   end
 
-  defp handle_workflow_op(state, from, thread_id, %Op.Phase{initial_state: initial_state, opts: opts}) do
+  defp handle_workflow_op(state, from, thread_id, %Op.Phase{
+         initial_state: initial_state,
+         opts: opts
+       }) do
     if state.phase do
       error = %RuntimeError{message: "nested phases are not supported by the Slice 2 core"}
       GenServer.reply(from, {:error, error})
@@ -566,7 +586,10 @@ defmodule Temporalex.Core.Executor do
   defp receive_signal(state, %Job.SignalReceived{} = signal) do
     cond do
       phase_accepts_signal?(state.phase, signal.name) ->
-        enqueue_phase_message(state, {:signal, signal.name, signal.args, signal.headers, signal.identity})
+        enqueue_phase_message(
+          state,
+          {:signal, signal.name, signal.args, signal.headers, signal.identity}
+        )
 
       has_signal_waiter?(state, signal.name) ->
         resolve_signal_waiter(state, signal.name, signal.args)
@@ -624,7 +647,10 @@ defmodule Temporalex.Core.Executor do
             protocol_instance_id: update.protocol_instance_id,
             response: :accepted
           })
-          |> enqueue_phase_message({:update, update.name, update.args, update.headers, update.protocol_instance_id, handler})
+          |> enqueue_phase_message(
+            {:update, update.name, update.args, update.headers, update.protocol_instance_id,
+             handler}
+          )
 
         {:error, reason} ->
           append_command(state, %Command.RespondToUpdate{
@@ -661,7 +687,11 @@ defmodule Temporalex.Core.Executor do
   defp respond_to_query(%Job.QueryReceived{} = query, state) do
     result =
       try do
-        case state.workflow_module.handle_query(query.query_type, query.args, state.published_state) do
+        case state.workflow_module.handle_query(
+               query.query_type,
+               query.args,
+               state.published_state
+             ) do
           {:reply, value} -> {:ok, value}
           {:error, reason} -> {:error, reason}
           other -> {:error, {:invalid_query_return, other}}
@@ -691,7 +721,13 @@ defmodule Temporalex.Core.Executor do
 
   defp maybe_start_phase_timer(%State{phase: %Phase{} = phase} = state) do
     seq = state.next_seq
-    command = %Command.StartTimer{seq: seq, thread_id: phase.owner_thread_id, duration_ms: phase.timeout_ms}
+
+    command = %Command.StartTimer{
+      seq: seq,
+      thread_id: phase.owner_thread_id,
+      duration_ms: phase.timeout_ms
+    }
+
     phase = %{phase | timeout_seq: seq}
 
     state
@@ -710,7 +746,10 @@ defmodule Temporalex.Core.Executor do
       end)
 
     Enum.reduce(matching, %{state | signal_buffer: remaining}, fn signal, acc ->
-      enqueue_phase_message(acc, {:signal, signal.name, signal.args, signal.headers, signal.identity})
+      enqueue_phase_message(
+        acc,
+        {:signal, signal.name, signal.args, signal.headers, signal.identity}
+      )
     end)
   end
 
@@ -785,6 +824,7 @@ defmodule Temporalex.Core.Executor do
 
   defp fire_phase_timeout(%State{phase: %Phase{id: phase_id} = phase} = state, phase_id) do
     phase = %{phase | stopping?: true, result: :timeout, timeout_fired?: true}
+
     %{state | phase: phase}
     |> maybe_complete_phase()
   end
@@ -918,7 +958,8 @@ defmodule Temporalex.Core.Executor do
     |> stop_phase(:stop)
   end
 
-  defp apply_signal_handler_result(state, thread, {:async, fun, new_state}) when is_function(fun) do
+  defp apply_signal_handler_result(state, thread, {:async, fun, new_state})
+       when is_function(fun) do
     state
     |> put_phase_state(new_state)
     |> spawn_async_handler(thread, fun, :async_signal_handler)
@@ -947,7 +988,8 @@ defmodule Temporalex.Core.Executor do
     |> stop_phase(:stop)
   end
 
-  defp apply_update_handler_result(state, thread, {:async, fun, new_state}) when is_function(fun) do
+  defp apply_update_handler_result(state, thread, {:async, fun, new_state})
+       when is_function(fun) do
     state
     |> put_phase_state(new_state)
     |> spawn_async_handler(thread, fun, :async_update_handler, thread.update_protocol_instance_id)
@@ -991,6 +1033,7 @@ defmodule Temporalex.Core.Executor do
 
   defp complete_async_signal(%State{phase: phase} = state, thread) do
     phase = %{phase | async_threads: MapSet.delete(phase.async_threads, thread.id)}
+
     %{state | phase: phase}
     |> maybe_dispatch_phase()
     |> maybe_complete_phase()
@@ -1006,6 +1049,7 @@ defmodule Temporalex.Core.Executor do
       })
 
     phase = %{state.phase | async_threads: MapSet.delete(phase.async_threads, thread.id)}
+
     %{state | phase: phase}
     |> maybe_dispatch_phase()
     |> maybe_complete_phase()
@@ -1067,7 +1111,9 @@ defmodule Temporalex.Core.Executor do
   defp spawn_thread(state, thread_id, kind, fun, opts \\ []) do
     executor = self()
     phase_id = Keyword.get(opts, :phase_id)
-    handler_mode = if kind in [:async_signal_handler, :async_update_handler], do: :async, else: nil
+
+    handler_mode =
+      if kind in [:async_signal_handler, :async_update_handler], do: :async, else: nil
 
     pid =
       spawn_link(fn ->
@@ -1104,7 +1150,10 @@ defmodule Temporalex.Core.Executor do
       send(executor, {:temporalex_thread_completed, thread_id, fun.()})
     rescue
       error ->
-        send(executor, {:temporalex_thread_failed, thread_id, {:exception, error, __STACKTRACE__}})
+        send(
+          executor,
+          {:temporalex_thread_failed, thread_id, {:exception, error, __STACKTRACE__}}
+        )
     catch
       kind, reason ->
         send(executor, {:temporalex_thread_failed, thread_id, {kind, reason, __STACKTRACE__}})
@@ -1147,19 +1196,34 @@ defmodule Temporalex.Core.Executor do
 
         cond do
           expected == nil ->
-            fail_activation(state, Nondeterminism.exception(message: "extra replay command", expected: nil, actual: command))
+            fail_activation(
+              state,
+              Nondeterminism.exception(
+                message: "extra replay command",
+                expected: nil,
+                actual: command
+              )
+            )
 
           command_identity(expected) == command_identity(command) ->
             %{state | expected_index: state.expected_index + 1}
 
           true ->
-            fail_activation(state, Nondeterminism.exception(message: "replay command mismatch", expected: expected, actual: command))
+            fail_activation(
+              state,
+              Nondeterminism.exception(
+                message: "replay command mismatch",
+                expected: expected,
+                actual: command
+              )
+            )
         end
     end
   end
 
   defp command_identity(%Command.ScheduleActivity{} = command) do
-    {:schedule_activity, command.seq, command.thread_id, command.activity_id, command.type, command.input, command.opts}
+    {:schedule_activity, command.seq, command.thread_id, command.activity_id, command.type,
+     command.input, command.opts}
   end
 
   defp command_identity(%Command.StartTimer{} = command) do
@@ -1167,12 +1231,22 @@ defmodule Temporalex.Core.Executor do
   end
 
   defp command_identity(%Command.CancelTimer{} = command), do: {:cancel_timer, command.seq}
-  defp command_identity(%Command.CompleteWorkflow{} = command), do: {:complete_workflow, command.result}
+
+  defp command_identity(%Command.CompleteWorkflow{} = command),
+    do: {:complete_workflow, command.result}
+
   defp command_identity(%Command.FailWorkflow{} = command), do: {:fail_workflow, command.reason}
   defp command_identity(%Command.ContinueAsNew{} = command), do: {:continue_as_new, command.args}
-  defp command_identity(%Command.RespondToUpdate{} = command), do: {:respond_update, command.protocol_instance_id, command.response}
-  defp command_identity(%Command.RespondToQuery{} = command), do: {:respond_query, command.query_id, command.result}
-  defp command_identity(%Command.UpsertSearchAttributes{} = command), do: {:upsert_search_attributes, command.attrs}
+
+  defp command_identity(%Command.RespondToUpdate{} = command),
+    do: {:respond_update, command.protocol_instance_id, command.response}
+
+  defp command_identity(%Command.RespondToQuery{} = command),
+    do: {:respond_query, command.query_id, command.result}
+
+  defp command_identity(%Command.UpsertSearchAttributes{} = command),
+    do: {:upsert_search_attributes, command.attrs}
+
   defp command_identity(command), do: command
 
   defp fail_activation(state, reason) do
@@ -1184,7 +1258,10 @@ defmodule Temporalex.Core.Executor do
   end
 
   defp completion_from_state(%State{activation_failed: reason} = state) do
-    %Completion{run_id: state.run_id, status: {:failed, reason, force_cause: failure_cause(reason)}}
+    %Completion{
+      run_id: state.run_id,
+      status: {:failed, reason, force_cause: failure_cause(reason)}
+    }
   end
 
   defp completion_from_state_open(%State{expected_commands: expected_commands} = state)
@@ -1201,7 +1278,10 @@ defmodule Temporalex.Core.Executor do
           actual: nil
         )
 
-      %Completion{run_id: state.run_id, status: {:failed, reason, force_cause: :non_deterministic_error}}
+      %Completion{
+        run_id: state.run_id,
+        status: {:failed, reason, force_cause: :non_deterministic_error}
+      }
     end
   end
 
