@@ -28,8 +28,9 @@ use temporalio_common::protos::coresdk::workflow_activation::{
 use temporalio_common::protos::coresdk::workflow_commands::{
     ActivityCancellationType, CancelTimer, CancelWorkflowExecution, CompleteWorkflowExecution,
     ContinueAsNewWorkflowExecution, FailWorkflowExecution, QueryResult, QuerySuccess,
-    ScheduleActivity, SetPatchMarker, StartTimer, UpdateResponse, UpsertWorkflowSearchAttributes,
-    WorkflowCommand, query_result, update_response, workflow_command,
+    RequestCancelActivity, ScheduleActivity, SetPatchMarker, StartTimer, UpdateResponse,
+    UpsertWorkflowSearchAttributes, WorkflowCommand, query_result, update_response,
+    workflow_command,
 };
 use temporalio_common::protos::coresdk::workflow_completion::{
     Failure as WorkflowCompletionFailure, Success as WorkflowCompletionSuccess,
@@ -1755,6 +1756,11 @@ fn command_from_term(command: Term, default_task_queue: &str) -> anyhow::Result<
         }
         "Elixir.Temporalex.Core.Command.CancelTimer" => {
             workflow_command::Variant::CancelTimer(CancelTimer {
+                seq: map_get_i64(command, seq())? as u32,
+            })
+        }
+        "Elixir.Temporalex.Core.Command.RequestCancelActivity" => {
+            workflow_command::Variant::RequestCancelActivity(RequestCancelActivity {
                 seq: map_get_i64(command, seq())? as u32,
             })
         }

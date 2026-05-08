@@ -82,19 +82,20 @@ defmodule Temporalex.Core.Thread do
             phase_id: nil,
             update_protocol_instance_id: nil,
             signal?: false,
-            started?: false
+            started?: false,
+            non_cancellable_depth: 0
 end
 
 defmodule Temporalex.Core.Pending do
   @moduledoc false
 
-  defstruct [:seq, :thread_id, :from, :op]
+  defstruct [:seq, :thread_id, :from, :op, cancel_requested?: false]
 end
 
 defmodule Temporalex.Core.ParallelScope do
   @moduledoc false
 
-  defstruct [:id, :parent_thread_id, :from, :size, results: %{}, remaining: 0]
+  defstruct [:id, :parent_thread_id, :from, :size, :cancellation, results: %{}, remaining: 0]
 end
 
 defmodule Temporalex.Core.Phase do
@@ -115,6 +116,7 @@ defmodule Temporalex.Core.Phase do
     dispatch_counter: 0,
     stopping?: false,
     result: nil,
+    cancellation: nil,
     timeout_fired?: false,
     timer_cancelled?: false
   ]
@@ -196,6 +198,11 @@ defmodule Temporalex.Core.Command.CancelTimer do
   defstruct [:seq]
 end
 
+defmodule Temporalex.Core.Command.RequestCancelActivity do
+  @moduledoc false
+  defstruct [:seq]
+end
+
 defmodule Temporalex.Core.Command.SetPatchMarker do
   @moduledoc false
   defstruct [:id, deprecated: false]
@@ -218,7 +225,7 @@ end
 
 defmodule Temporalex.Core.Command.CancelWorkflow do
   @moduledoc false
-  defstruct []
+  defstruct [:reason]
 end
 
 defmodule Temporalex.Core.Command.RespondToUpdate do
@@ -292,6 +299,21 @@ defmodule Temporalex.Core.Op.WorkflowInfo do
 end
 
 defmodule Temporalex.Core.Op.Cancelled do
+  @moduledoc false
+  defstruct []
+end
+
+defmodule Temporalex.Core.Op.Cancellation do
+  @moduledoc false
+  defstruct []
+end
+
+defmodule Temporalex.Core.Op.EnterNonCancellable do
+  @moduledoc false
+  defstruct []
+end
+
+defmodule Temporalex.Core.Op.ExitNonCancellable do
   @moduledoc false
   defstruct []
 end
