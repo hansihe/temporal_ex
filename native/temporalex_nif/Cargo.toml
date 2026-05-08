@@ -13,6 +13,7 @@ anyhow = "1"
 prost = "0.14"
 prost-types = { version = "0.7", package = "prost-wkt-types" }
 rustler = "=0.37.3"
+serde_json = "1"
 temporalio-client = { path = "../../../temporal-sdk-core/crates/client", features = ["core-based-sdk"] }
 temporalio-common = { path = "../../../temporal-sdk-core/crates/common" }
 temporalio-sdk-core = { path = "../../../temporal-sdk-core/crates/sdk-core" }

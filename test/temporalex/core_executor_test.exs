@@ -5,6 +5,7 @@ defmodule Temporalex.CoreExecutorTest do
   alias Temporalex.Core.Job
   alias Temporalex.Core.Nondeterminism
   alias Temporalex.Core.TestHarness
+  alias Temporalex.SearchAttribute
   alias Temporalex.Workflow.API
 
   defmodule Activities do
@@ -111,7 +112,12 @@ defmodule Temporalex.CoreExecutorTest do
     use Temporalex.Workflow
 
     def run(_) do
-      :ok = API.upsert_search_attributes(%{"CustomKeywordField" => "alpha"})
+      :ok =
+        API.upsert_search_attributes(%{
+          "CustomIntField" => 7,
+          CustomKeywordField: Temporalex.SearchAttribute.keyword("alpha")
+        })
+
       {:ok, :done}
     end
   end
@@ -464,7 +470,12 @@ defmodule Temporalex.CoreExecutorTest do
 
       assert {:ok,
               [
-                %Command.UpsertSearchAttributes{attrs: %{"CustomKeywordField" => "alpha"}},
+                %Command.UpsertSearchAttributes{
+                  attrs: %{
+                    "CustomKeywordField" => %SearchAttribute{type: :keyword, value: "alpha"},
+                    "CustomIntField" => 7
+                  }
+                },
                 %Command.CompleteWorkflow{result: :done}
               ]} = completion.status
     end
@@ -563,7 +574,9 @@ defmodule Temporalex.CoreExecutorTest do
                      workflow_info: %{},
                      randomness_seed: 0
                    }
-                 ], replay: true).status
+                 ],
+                 replay: true
+               ).status
 
       assert {:ok, exec} = TestHarness.start_workflow(PatchWorkflow, nil)
 
@@ -578,7 +591,9 @@ defmodule Temporalex.CoreExecutorTest do
                      workflow_info: %{},
                      randomness_seed: 0
                    }
-                 ], replay: true).status
+                 ],
+                 replay: true
+               ).status
     end
 
     test "workflow processes carry only the Temporalex context key" do

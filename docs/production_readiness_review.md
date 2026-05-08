@@ -10,14 +10,21 @@ The current architecture looks broadly sane for Elixir: workflow command constru
 
 ### Search Attributes Must Be Server-Readable
 
-Status: open.
+Status: completed on May 8, 2026.
 
-Current concern:
+Original concern:
 
 - `native/temporalex_nif/src/lib.rs` uses `term_to_payload_map/1` for headers and search attributes.
 - `payload_from_term/1` encodes values as ETF payloads with `encoding = binary/erlang-eterm`.
 - Temporal Search Attributes are indexed visibility fields; Temporal's proto states that Search Attribute payloads are not user-defined serialization.
 - Temporal Core's own payload visitor skips Search Attribute payload encoding so the server can read them.
+
+Implemented:
+
+- Added `Temporalex.SearchAttribute` typed constructors for Bool, Datetime, Double, Int, Keyword, KeywordList, and Text values.
+- Kept ETF encoding for normal payloads and switched Search Attribute maps to `json/plain` payloads in the native encoder.
+- Wired typed Search Attributes through workflow start and `Workflow.API.upsert_search_attributes/1`.
+- Added constructor/unit tests, native codec validation coverage, and a Temporal dev-server visibility test that registers custom Search Attributes, upserts from workflow code, and lists by Search Attribute query.
 
 References:
 
@@ -26,12 +33,9 @@ References:
 - `../../temporal-sdk-core/crates/common/src/payload_visitor.rs`: search attributes skipped during payload encoding.
 - `../../documentation/docs/encyclopedia/visibility/search-attributes.mdx`: supported Search Attribute types and visibility behavior.
 
-Needed:
+Remaining follow-up:
 
-- Add a dedicated Search Attribute encoder instead of reusing the ETF payload converter.
-- Support Temporal Search Attribute types: Bool, Datetime, Double, Int, Keyword, KeywordList, and Text.
-- Apply it consistently to workflow start, continue-as-new, child workflows when added, and `upsert_search_attributes/1`.
-- Add real Temporal dev-server tests that start/upsert Search Attributes and verify they can be queried through visibility.
+- Reuse the same typed encoder when continue-as-new and child workflow Search Attributes are added.
 
 ### Workflow Cancellation Semantics Are Incomplete
 
@@ -192,22 +196,25 @@ Needed:
 
 ### Retry Policy Validation Bug
 
-Status: open.
+Status: completed on May 8, 2026.
 
-Current concern:
+Original concern:
 
 - `retry_policy_from_term/1` rejects negative `backoff_coefficient` but allows values between 0 and 1.
 - Temporal requires the coefficient to be 1 or larger.
+
+Implemented:
+
+- Native retry policy validation now rejects explicit `backoff_coefficient` values below `1.0`, including `0.0`.
+- Codec tests cover `0.0` and `0.5`.
 
 References:
 
 - `../native/temporalex_nif/src/lib.rs`: `retry_policy_from_term`.
 - `../../temporal-api/temporal/api/common/v1/message.proto`: `RetryPolicy.backoff_coefficient`.
 
-Needed:
+Remaining follow-up:
 
-- Reject explicit values below 1.0.
-- Add native option validation tests for `0.0` and `0.5`.
 - Consider validating `maximum_interval >= initial_interval` if Temporal Core/server does not already give a clear error.
 
 ## Testing Strategy Gaps
@@ -221,7 +228,7 @@ Current coverage:
 
 Missing production-confidence tests:
 
-- Search Attribute visibility against the dev server.
+- Additional Search Attribute visibility cases beyond the current start/upsert smoke path, if needed.
 - Cancellation while blocked on timer, activity, phase, signal wait, update handler, and parallel branch.
 - Activity retry and non-retryable error behavior against the server.
 - Continue-as-new chains, including result retrieval across runs and option propagation.
@@ -240,4 +247,3 @@ These are not tracked as blockers in this document unless priorities change:
 - Pluggable data converters or safe ETF mode.
 - Production packaging, CI, and release automation.
 - Nexus support, unless it becomes a near-term product requirement.
-
