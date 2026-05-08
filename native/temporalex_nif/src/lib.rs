@@ -13,7 +13,10 @@ use temporalio_client::{
     WorkflowExecuteUpdateOptions, WorkflowExecutionDescription, WorkflowExecutionInfo,
     WorkflowGetResultOptions, WorkflowHandle, WorkflowQueryOptions, WorkflowSignalOptions,
     WorkflowStartOptions, WorkflowTerminateOptions,
-    errors::{WorkflowGetResultError, WorkflowQueryError, WorkflowStartError, WorkflowUpdateError},
+    errors::{
+        WorkflowGetResultError, WorkflowInteractionError, WorkflowQueryError, WorkflowStartError,
+        WorkflowUpdateError,
+    },
 };
 use temporalio_common::data_converters::RawValue;
 use temporalio_common::protos::coresdk::activity_result::{
@@ -198,6 +201,9 @@ rustler::atoms! {
     unknown_failure,
     already_started,
     not_found,
+    payload_conversion,
+    invalid_options,
+    rpc,
     execution_timeout,
     workflow_execution_timeout,
     run_timeout,
@@ -730,7 +736,13 @@ fn start_workflow<'a>(
     let start_options = match workflow_start_options(task_queue, workflow_id.clone(), opts) {
         Ok(options) => options,
         Err(err) => {
-            send_immediate_ref_error(env, reference, &pid, workflow_started(), format!("{err:#}"));
+            send_immediate_ref_error(
+                env,
+                reference,
+                &pid,
+                workflow_started(),
+                error_reason(env, invalid_options(), format!("{err:#}")),
+            );
             return ok();
         }
     };
@@ -812,7 +824,11 @@ fn get_workflow_result(
                 Ok(payloads) => match payloads.into_iter().next() {
                     Some(payload) => match payload_to_term(env, &payload) {
                         Ok(term) => (ok(), term).encode(env),
-                        Err(err) => (error(), format!("{err:#}")).encode(env),
+                        Err(err) => (
+                            error(),
+                            error_reason(env, payload_conversion(), format!("{err:#}")),
+                        )
+                            .encode(env),
                     },
                     None => (ok(), nil()).encode(env),
                 },
@@ -845,7 +861,7 @@ fn signal_workflow<'a>(
                 reference,
                 &pid,
                 workflow_signalled(),
-                format!("{err:#}"),
+                error_reason(env, payload_conversion(), format!("{err:#}")),
             );
             return ok();
         }
@@ -858,7 +874,7 @@ fn signal_workflow<'a>(
                 reference,
                 &pid,
                 workflow_signalled(),
-                format!("{err:#}"),
+                error_reason(env, invalid_options(), format!("{err:#}")),
             );
             return ok();
         }
@@ -870,14 +886,16 @@ fn signal_workflow<'a>(
 
     handle.spawn(async move {
         let result = async {
-            let wf = untyped_handle(connection, namespace, workflow_id, run_id)?;
+            let wf = untyped_handle(connection, namespace, workflow_id, run_id)
+                .map_err(WorkflowInteractionResult::Other)?;
             wf.signal(
                 UntypedSignal::<UntypedWorkflow>::new(signal_name),
                 RawValue::new(payloads),
                 options,
             )
-            .await?;
-            Ok::<_, anyhow::Error>(())
+            .await
+            .map_err(WorkflowInteractionResult::Interaction)?;
+            Ok::<_, WorkflowInteractionResult>(())
         }
         .await;
 
@@ -888,7 +906,7 @@ fn signal_workflow<'a>(
             workflow_signalled(),
             |env| match result {
                 Ok(()) => (ok(), ok()).encode(env),
-                Err(err) => (error(), format!("{err:#}")).encode(env),
+                Err(err) => (error(), workflow_interaction_error_to_term(env, err)).encode(env),
             },
         );
     });
@@ -912,14 +930,26 @@ fn query_workflow<'a>(
     let payloads = match terms_list_to_payloads(args_term) {
         Ok(payloads) => payloads,
         Err(err) => {
-            send_immediate_ref_error(env, reference, &pid, workflow_queried(), format!("{err:#}"));
+            send_immediate_ref_error(
+                env,
+                reference,
+                &pid,
+                workflow_queried(),
+                error_reason(env, payload_conversion(), format!("{err:#}")),
+            );
             return ok();
         }
     };
     let options = match query_options(opts) {
         Ok(options) => options,
         Err(err) => {
-            send_immediate_ref_error(env, reference, &pid, workflow_queried(), format!("{err:#}"));
+            send_immediate_ref_error(
+                env,
+                reference,
+                &pid,
+                workflow_queried(),
+                error_reason(env, invalid_options(), format!("{err:#}")),
+            );
             return ok();
         }
     };
@@ -975,14 +1005,26 @@ fn update_workflow<'a>(
     let payloads = match terms_list_to_payloads(args_term) {
         Ok(payloads) => payloads,
         Err(err) => {
-            send_immediate_ref_error(env, reference, &pid, workflow_updated(), format!("{err:#}"));
+            send_immediate_ref_error(
+                env,
+                reference,
+                &pid,
+                workflow_updated(),
+                error_reason(env, payload_conversion(), format!("{err:#}")),
+            );
             return ok();
         }
     };
     let options = match update_options(opts) {
         Ok(options) => options,
         Err(err) => {
-            send_immediate_ref_error(env, reference, &pid, workflow_updated(), format!("{err:#}"));
+            send_immediate_ref_error(
+                env,
+                reference,
+                &pid,
+                workflow_updated(),
+                error_reason(env, invalid_options(), format!("{err:#}")),
+            );
             return ok();
         }
     };
@@ -1040,12 +1082,15 @@ fn cancel_workflow(
 
     handle.spawn(async move {
         let result = async {
-            let wf = untyped_handle(connection, namespace, workflow_id, run_id)?;
+            let wf = untyped_handle(connection, namespace, workflow_id, run_id)
+                .map_err(WorkflowInteractionResult::Other)?;
             let mut options = WorkflowCancelOptions::default();
             options.reason = reason_text;
             options.request_id = request_id_text;
-            wf.cancel(options).await?;
-            Ok::<_, anyhow::Error>(())
+            wf.cancel(options)
+                .await
+                .map_err(WorkflowInteractionResult::Interaction)?;
+            Ok::<_, WorkflowInteractionResult>(())
         }
         .await;
 
@@ -1056,7 +1101,7 @@ fn cancel_workflow(
             workflow_cancelled(),
             |env| match result {
                 Ok(()) => (ok(), ok()).encode(env),
-                Err(err) => (error(), format!("{err:#}")).encode(env),
+                Err(err) => (error(), workflow_interaction_error_to_term(env, err)).encode(env),
             },
         );
     });
@@ -1089,12 +1134,15 @@ fn terminate_workflow(
 
     handle.spawn(async move {
         let result = async {
-            let wf = untyped_handle(connection, namespace, workflow_id, run_id)?;
+            let wf = untyped_handle(connection, namespace, workflow_id, run_id)
+                .map_err(WorkflowInteractionResult::Other)?;
             let mut options = WorkflowTerminateOptions::default();
             options.reason = reason_text;
             options.details = details;
-            wf.terminate(options).await?;
-            Ok::<_, anyhow::Error>(())
+            wf.terminate(options)
+                .await
+                .map_err(WorkflowInteractionResult::Interaction)?;
+            Ok::<_, WorkflowInteractionResult>(())
         }
         .await;
 
@@ -1105,7 +1153,7 @@ fn terminate_workflow(
             workflow_terminated(),
             |env| match result {
                 Ok(()) => (ok(), ok()).encode(env),
-                Err(err) => (error(), format!("{err:#}")).encode(env),
+                Err(err) => (error(), workflow_interaction_error_to_term(env, err)).encode(env),
             },
         );
     });
@@ -1129,9 +1177,13 @@ fn describe_workflow(
 
     handle.spawn(async move {
         let result = async {
-            let wf = untyped_handle(connection, namespace, workflow_id, run_id)?;
-            let description = wf.describe(WorkflowDescribeOptions::default()).await?;
-            Ok::<_, anyhow::Error>(description)
+            let wf = untyped_handle(connection, namespace, workflow_id, run_id)
+                .map_err(WorkflowInteractionResult::Other)?;
+            let description = wf
+                .describe(WorkflowDescribeOptions::default())
+                .await
+                .map_err(WorkflowInteractionResult::Interaction)?;
+            Ok::<_, WorkflowInteractionResult>(description)
         }
         .await;
 
@@ -1143,9 +1195,13 @@ fn describe_workflow(
             |env| match result {
                 Ok(description) => match workflow_description_to_term(env, &description) {
                     Ok(term) => (ok(), term).encode(env),
-                    Err(err) => (error(), format!("{err:#}")).encode(env),
+                    Err(err) => (
+                        error(),
+                        error_reason(env, payload_conversion(), format!("{err:#}")),
+                    )
+                        .encode(env),
                 },
-                Err(err) => (error(), format!("{err:#}")).encode(env),
+                Err(err) => (error(), workflow_interaction_error_to_term(env, err)).encode(env),
             },
         );
     });
@@ -1268,7 +1324,7 @@ fn send_immediate_ref_error<'a>(
     reference: Term<'a>,
     pid: &LocalPid,
     tag: Atom,
-    reason: String,
+    reason: Term<'a>,
 ) {
     let _ = env.send(pid, (tag, reference, (error(), reason)));
 }
@@ -1290,6 +1346,11 @@ enum QueryWorkflowResult {
 
 enum UpdateWorkflowResult {
     Update(WorkflowUpdateError),
+    Other(anyhow::Error),
+}
+
+enum WorkflowInteractionResult {
+    Interaction(WorkflowInteractionError),
     Other(anyhow::Error),
 }
 
@@ -1315,10 +1376,18 @@ fn payload_result_to_term<'a>(env: Env<'a>, payloads: Vec<Payload>) -> Term<'a> 
     match payloads.into_iter().next() {
         Some(payload) => match payload_to_term(env, &payload) {
             Ok(term) => (ok(), term).encode(env),
-            Err(err) => (error(), format!("{err:#}")).encode(env),
+            Err(err) => (
+                error(),
+                error_reason(env, payload_conversion(), format!("{err:#}")),
+            )
+                .encode(env),
         },
         None => (ok(), nil()).encode(env),
     }
+}
+
+fn error_reason<'a>(env: Env<'a>, tag: Atom, message: String) -> Term<'a> {
+    (tag, string_term(env, message)).encode(env)
 }
 
 fn workflow_start_error_to_term<'a>(env: Env<'a>, err: StartWorkflowResult) -> Term<'a> {
@@ -1329,8 +1398,14 @@ fn workflow_start_error_to_term<'a>(env: Env<'a>, err: StartWorkflowResult) -> T
                 .unwrap_or_else(|| nil().encode(env));
             (already_started(), run_id_term).encode(env)
         }
-        StartWorkflowResult::Start(err) => string_term(env, format!("{err:#}")),
-        StartWorkflowResult::Other(reason) => string_term(env, reason),
+        StartWorkflowResult::Start(WorkflowStartError::PayloadConversion(err)) => {
+            error_reason(env, payload_conversion(), format!("{err:#}"))
+        }
+        StartWorkflowResult::Start(WorkflowStartError::Rpc(err)) => {
+            error_reason(env, rpc(), format!("{err:#}"))
+        }
+        StartWorkflowResult::Start(err) => error_reason(env, rpc(), format!("{err:#}")),
+        StartWorkflowResult::Other(reason) => error_reason(env, rpc(), reason),
     }
 }
 
@@ -1339,19 +1414,19 @@ fn get_workflow_result_error_to_term<'a>(env: Env<'a>, err: GetWorkflowResult) -
         GetWorkflowResult::Get(WorkflowGetResultError::Failed(failure)) => {
             match failure_to_term(env, Some(failure.as_ref())) {
                 Ok(term) => (failed(), term).encode(env),
-                Err(err) => string_term(env, format!("{err:#}")),
+                Err(err) => error_reason(env, payload_conversion(), format!("{err:#}")),
             }
         }
         GetWorkflowResult::Get(WorkflowGetResultError::Cancelled { details }) => {
             match payloads_to_terms(env, &details) {
                 Ok(terms) => (cancelled(), terms).encode(env),
-                Err(err) => string_term(env, format!("{err:#}")),
+                Err(err) => error_reason(env, payload_conversion(), format!("{err:#}")),
             }
         }
         GetWorkflowResult::Get(WorkflowGetResultError::Terminated { details }) => {
             match payloads_to_terms(env, &details) {
                 Ok(terms) => (terminated(), terms).encode(env),
-                Err(err) => string_term(env, format!("{err:#}")),
+                Err(err) => error_reason(env, payload_conversion(), format!("{err:#}")),
             }
         }
         GetWorkflowResult::Get(WorkflowGetResultError::TimedOut) => timed_out().encode(env),
@@ -1359,8 +1434,14 @@ fn get_workflow_result_error_to_term<'a>(env: Env<'a>, err: GetWorkflowResult) -
             continued_as_new().encode(env)
         }
         GetWorkflowResult::Get(WorkflowGetResultError::NotFound(_)) => not_found().encode(env),
-        GetWorkflowResult::Get(err) => string_term(env, format!("{err:#}")),
-        GetWorkflowResult::Other(err) => string_term(env, format!("{err:#}")),
+        GetWorkflowResult::Get(WorkflowGetResultError::PayloadConversion(err)) => {
+            error_reason(env, payload_conversion(), format!("{err:#}"))
+        }
+        GetWorkflowResult::Get(WorkflowGetResultError::Rpc(err)) => {
+            error_reason(env, rpc(), format!("{err:#}"))
+        }
+        GetWorkflowResult::Get(err) => error_reason(env, rpc(), format!("{err:#}")),
+        GetWorkflowResult::Other(err) => error_reason(env, rpc(), format!("{err:#}")),
     }
 }
 
@@ -1372,8 +1453,14 @@ fn query_workflow_error_to_term<'a>(env: Env<'a>, err: QueryWorkflowResult) -> T
             (rejected(), workflow_status_atom(status)).encode(env)
         }
         QueryWorkflowResult::Query(WorkflowQueryError::NotFound(_)) => not_found().encode(env),
-        QueryWorkflowResult::Query(err) => string_term(env, format!("{err:#}")),
-        QueryWorkflowResult::Other(err) => string_term(env, format!("{err:#}")),
+        QueryWorkflowResult::Query(WorkflowQueryError::PayloadConversion(err)) => {
+            error_reason(env, payload_conversion(), format!("{err:#}"))
+        }
+        QueryWorkflowResult::Query(WorkflowQueryError::Rpc(err)) => {
+            error_reason(env, rpc(), format!("{err:#}"))
+        }
+        QueryWorkflowResult::Query(err) => error_reason(env, rpc(), format!("{err:#}")),
+        QueryWorkflowResult::Other(err) => error_reason(env, rpc(), format!("{err:#}")),
     }
 }
 
@@ -1382,12 +1469,37 @@ fn update_workflow_error_to_term<'a>(env: Env<'a>, err: UpdateWorkflowResult) ->
         UpdateWorkflowResult::Update(WorkflowUpdateError::Failed(failure)) => {
             match failure_to_term(env, Some(failure.as_ref())) {
                 Ok(term) => (failed(), term).encode(env),
-                Err(err) => string_term(env, format!("{err:#}")),
+                Err(err) => error_reason(env, payload_conversion(), format!("{err:#}")),
             }
         }
         UpdateWorkflowResult::Update(WorkflowUpdateError::NotFound(_)) => not_found().encode(env),
-        UpdateWorkflowResult::Update(err) => string_term(env, format!("{err:#}")),
-        UpdateWorkflowResult::Other(err) => string_term(env, format!("{err:#}")),
+        UpdateWorkflowResult::Update(WorkflowUpdateError::PayloadConversion(err)) => {
+            error_reason(env, payload_conversion(), format!("{err:#}"))
+        }
+        UpdateWorkflowResult::Update(WorkflowUpdateError::Rpc(err)) => {
+            error_reason(env, rpc(), format!("{err:#}"))
+        }
+        UpdateWorkflowResult::Update(err) => error_reason(env, rpc(), format!("{err:#}")),
+        UpdateWorkflowResult::Other(err) => error_reason(env, rpc(), format!("{err:#}")),
+    }
+}
+
+fn workflow_interaction_error_to_term<'a>(
+    env: Env<'a>,
+    err: WorkflowInteractionResult,
+) -> Term<'a> {
+    match err {
+        WorkflowInteractionResult::Interaction(WorkflowInteractionError::NotFound(_)) => {
+            not_found().encode(env)
+        }
+        WorkflowInteractionResult::Interaction(WorkflowInteractionError::PayloadConversion(
+            err,
+        )) => error_reason(env, payload_conversion(), format!("{err:#}")),
+        WorkflowInteractionResult::Interaction(WorkflowInteractionError::Rpc(err)) => {
+            error_reason(env, rpc(), format!("{err:#}"))
+        }
+        WorkflowInteractionResult::Interaction(err) => error_reason(env, rpc(), format!("{err:#}")),
+        WorkflowInteractionResult::Other(err) => error_reason(env, rpc(), format!("{err:#}")),
     }
 }
 
