@@ -564,35 +564,30 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
   end
 
   defp command_to_proto(%Command.ScheduleActivity{} = command, default_task_queue) do
-    opts = command.opts || []
-
-    with {:ok, timeout_ms} <- activity_timeout_ms(opts),
-         {:ok, schedule_to_close_timeout} <-
-           duration_from_opts(
-             opts,
-             [:schedule_to_close_timeout],
-             timeout_ms,
+    with {:ok, schedule_to_close_timeout} <-
+           duration_from_ms(
+             command.schedule_to_close_timeout_ms,
              "activity schedule_to_close_timeout"
            ),
          {:ok, schedule_to_start_timeout} <-
-           optional_duration_from_opts(
-             opts,
-             [:schedule_to_start_timeout],
+           optional_duration_ms(
+             command.schedule_to_start_timeout_ms,
              "activity schedule_to_start_timeout"
            ),
          {:ok, start_to_close_timeout} <-
-           duration_from_ms(timeout_ms, "activity start_to_close_timeout"),
+           duration_from_ms(command.start_to_close_timeout_ms, "activity start_to_close_timeout"),
          {:ok, heartbeat_timeout} <-
-           optional_duration_from_opts(opts, [:heartbeat_timeout], "activity heartbeat_timeout"),
-         {:ok, headers} <- payload_map_from_opts(opts, :headers),
-         {:ok, retry_policy} <- retry_policy_from_opts(opts),
-         {:ok, cancellation_type} <- activity_cancellation_type_from_opts(opts) do
+           optional_duration_ms(command.heartbeat_timeout_ms, "activity heartbeat_timeout"),
+         {:ok, headers} <- PayloadConverter.term_to_payload_map(command.headers),
+         {:ok, retry_policy} <- retry_policy_to_proto(command.retry_policy),
+         {:ok, cancellation_type} <-
+           activity_cancellation_type_to_proto(command.cancellation_type) do
       schedule =
         compact(%{
           seq: command.seq,
           activity_id: command.activity_id,
           activity_type: command.type,
-          task_queue: Keyword.get(opts, :task_queue, default_task_queue),
+          task_queue: command.task_queue || default_task_queue,
           headers: headers,
           arguments: PayloadConverter.term_to_payloads_list(command.input || []),
           schedule_to_close_timeout: schedule_to_close_timeout,
@@ -601,7 +596,7 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
           heartbeat_timeout: heartbeat_timeout,
           retry_policy: retry_policy,
           cancellation_type: cancellation_type,
-          do_not_eagerly_execute: false
+          do_not_eagerly_execute: command.do_not_eagerly_execute
         })
 
       {:ok, %{variant: {:schedule_activity, schedule}}}
@@ -626,26 +621,23 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
   end
 
   defp command_to_proto(%Command.ContinueAsNew{} = command, _task_queue) do
-    opts = command.opts || []
-
     with {:ok, workflow_run_timeout} <-
-           optional_duration_from_opts(
-             opts,
-             [:run_timeout, :workflow_run_timeout],
-             "duration option"
+           optional_duration_ms(
+             command.workflow_run_timeout_ms,
+             "continue-as-new workflow_run_timeout"
            ),
          {:ok, workflow_task_timeout} <-
-           optional_duration_from_opts(
-             opts,
-             [:task_timeout, :workflow_task_timeout],
-             "duration option"
+           optional_duration_ms(
+             command.workflow_task_timeout_ms,
+             "continue-as-new workflow_task_timeout"
            ),
-         {:ok, memo} <- payload_map_from_opts(opts, :memo),
-         {:ok, headers} <- payload_map_from_opts(opts, :headers),
-         {:ok, search_attributes} <- search_attributes_from_opts(opts),
-         {:ok, retry_policy} <- retry_policy_from_opts(opts),
-         {:ok, versioning_intent} <- versioning_intent_from_opts(opts),
-         {:ok, initial_versioning_behavior} <- continue_as_new_versioning_behavior_from_opts(opts) do
+         {:ok, memo} <- PayloadConverter.term_to_payload_map(command.memo),
+         {:ok, headers} <- PayloadConverter.term_to_payload_map(command.headers),
+         {:ok, search_attributes} <- search_attributes_to_proto(command.search_attributes),
+         {:ok, retry_policy} <- retry_policy_to_proto(command.retry_policy),
+         {:ok, versioning_intent} <- versioning_intent_to_proto(command.versioning_intent),
+         {:ok, initial_versioning_behavior} <-
+           continue_as_new_versioning_behavior_to_proto(command.initial_versioning_behavior) do
       continue =
         compact(%{
           workflow_type: command.workflow_type || "",
@@ -897,34 +889,14 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
   defp maybe_failure(nil, _message), do: nil
   defp maybe_failure(cause, message), do: failure_to_proto(cause, message)
 
-  defp activity_timeout_ms(opts) do
-    timeout =
-      Keyword.get(opts, :timeout) ||
-        Keyword.get(opts, :start_to_close_timeout) ||
-        60_000
-
-    non_negative_millis(timeout, "activity timeout")
-  end
-
-  defp duration_from_opts(opts, keys, default_ms, option_name) do
-    case find_option(opts, keys) do
-      nil -> duration_from_ms(default_ms, option_name)
-      ms -> duration_from_ms(ms, option_name)
-    end
-  end
-
-  defp optional_duration_from_opts(opts, keys, option_name) do
-    case find_option(opts, keys) do
-      nil -> {:ok, nil}
-      ms -> duration_from_ms(ms, option_name)
-    end
-  end
-
   defp duration_from_ms(ms, option_name) do
     with {:ok, ms} <- non_negative_millis(ms, option_name) do
       {:ok, ms}
     end
   end
+
+  defp optional_duration_ms(nil, _option_name), do: {:ok, nil}
+  defp optional_duration_ms(ms, option_name), do: duration_from_ms(ms, option_name)
 
   defp non_negative_millis(ms, _option_name) when is_integer(ms) and ms >= 0, do: {:ok, ms}
 
@@ -934,114 +906,96 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
   defp non_negative_millis(_ms, option_name),
     do: {:error, "#{option_name} must be an integer number of milliseconds"}
 
-  defp payload_map_from_opts(opts, key) do
-    opts
-    |> Keyword.get(key)
-    |> PayloadConverter.term_to_payload_map()
-  end
+  defp search_attributes_to_proto(nil), do: {:ok, nil}
 
-  defp search_attributes_from_opts(opts) do
-    case Keyword.fetch(opts, :search_attributes) do
-      :error ->
-        {:ok, nil}
-
-      {:ok, nil} ->
-        {:ok, nil}
-
-      {:ok, attrs} ->
-        with {:ok, indexed_fields} <- PayloadConverter.search_attributes_to_payload_map(attrs) do
-          {:ok, %{indexed_fields: indexed_fields}}
-        end
+  defp search_attributes_to_proto(attrs) do
+    with {:ok, indexed_fields} <- PayloadConverter.search_attributes_to_payload_map(attrs) do
+      {:ok, %{indexed_fields: indexed_fields}}
     end
   end
 
-  defp retry_policy_from_opts(opts) do
-    case Keyword.fetch(opts, :retry_policy) do
-      :error -> {:ok, nil}
-      {:ok, nil} -> {:ok, nil}
-      {:ok, retry_policy} -> retry_policy_to_proto(retry_policy)
-    end
-  end
+  defp retry_policy_to_proto(nil), do: {:ok, nil}
 
-  defp retry_policy_to_proto(opts) when is_list(opts) do
+  defp retry_policy_to_proto(%Command.RetryPolicy{} = policy) do
     with {:ok, initial_interval} <-
-           optional_duration_from_opts(opts, [:initial_interval], "retry_policy.initial_interval"),
+           optional_duration_ms(policy.initial_interval_ms, "retry_policy.initial_interval"),
          {:ok, maximum_interval} <-
-           optional_duration_from_opts(opts, [:maximum_interval], "retry_policy.maximum_interval"),
-         {:ok, backoff_coefficient} <- backoff_coefficient_from_opts(opts),
-         {:ok, maximum_attempts} <- maximum_attempts_from_opts(opts) do
+           optional_duration_ms(policy.maximum_interval_ms, "retry_policy.maximum_interval"),
+         {:ok, backoff_coefficient} <- backoff_coefficient_to_proto(policy.backoff_coefficient),
+         {:ok, maximum_attempts} <- maximum_attempts_to_proto(policy.maximum_attempts),
+         {:ok, non_retryable_error_types} <-
+           non_retryable_error_types_to_proto(policy.non_retryable_error_types) do
       {:ok,
        compact(%{
          initial_interval: initial_interval,
          backoff_coefficient: backoff_coefficient,
          maximum_interval: maximum_interval,
          maximum_attempts: maximum_attempts,
-         non_retryable_error_types: Keyword.get(opts, :non_retryable_error_types, [])
+         non_retryable_error_types: non_retryable_error_types
        })}
     end
   end
 
-  defp retry_policy_to_proto(_opts), do: {:error, "retry_policy must be a keyword list"}
+  defp retry_policy_to_proto(_policy), do: {:error, "retry_policy must be a canonical policy"}
 
-  defp backoff_coefficient_from_opts(opts) do
-    case Keyword.get(opts, :backoff_coefficient) do
-      nil ->
-        {:ok, 0.0}
+  defp backoff_coefficient_to_proto(nil), do: {:ok, nil}
 
-      value when is_number(value) and value >= 1.0 ->
-        {:ok, value * 1.0}
+  defp backoff_coefficient_to_proto(value) when is_number(value) and value >= 1.0,
+    do: {:ok, value * 1.0}
 
-      value when is_number(value) ->
-        {:error, "retry_policy.backoff_coefficient must be 1.0 or larger"}
+  defp backoff_coefficient_to_proto(value) when is_number(value),
+    do: {:error, "retry_policy.backoff_coefficient must be 1.0 or larger"}
 
-      _value ->
-        {:error, "retry_policy.backoff_coefficient must be numeric"}
+  defp backoff_coefficient_to_proto(_value),
+    do: {:error, "retry_policy.backoff_coefficient must be numeric"}
+
+  defp maximum_attempts_to_proto(attempts)
+       when is_integer(attempts) and attempts >= 0 and attempts <= 2_147_483_647,
+       do: {:ok, attempts}
+
+  defp maximum_attempts_to_proto(_attempts),
+    do: {:error, "retry_policy.maximum_attempts must fit in a non-negative i32"}
+
+  defp non_retryable_error_types_to_proto(error_types) do
+    if is_list(error_types) and Enum.all?(error_types, &is_binary/1) do
+      {:ok, error_types}
+    else
+      {:error, "retry_policy.non_retryable_error_types must be a list of strings"}
     end
   end
 
-  defp maximum_attempts_from_opts(opts) do
-    attempts = Keyword.get(opts, :maximum_attempts, 0)
+  defp activity_cancellation_type_to_proto(:try_cancel), do: {:ok, :TRY_CANCEL}
 
-    cond do
-      not is_integer(attempts) ->
-        {:error, "retry_policy.maximum_attempts must fit in a non-negative i32"}
+  defp activity_cancellation_type_to_proto(:wait_cancellation_completed),
+    do: {:ok, :WAIT_CANCELLATION_COMPLETED}
 
-      attempts < 0 or attempts > 2_147_483_647 ->
-        {:error, "retry_policy.maximum_attempts must fit in a non-negative i32"}
+  defp activity_cancellation_type_to_proto(:abandon), do: {:ok, :ABANDON}
 
-      true ->
-        {:ok, attempts}
-    end
-  end
+  defp activity_cancellation_type_to_proto(_type),
+    do: {:error, "unsupported activity cancellation type"}
 
-  defp activity_cancellation_type_from_opts(opts) do
-    case Keyword.get(opts, :cancellation_type, :wait_cancellation_completed) do
-      :try_cancel -> {:ok, :TRY_CANCEL}
-      :wait_cancellation_completed -> {:ok, :WAIT_CANCELLATION_COMPLETED}
-      :abandon -> {:ok, :ABANDON}
-      _ -> {:error, "unsupported activity cancellation type"}
-    end
-  end
+  defp versioning_intent_to_proto(nil), do: {:ok, :UNSPECIFIED}
+  defp versioning_intent_to_proto(:unspecified), do: {:ok, :UNSPECIFIED}
+  defp versioning_intent_to_proto(:compatible), do: {:ok, :COMPATIBLE}
+  defp versioning_intent_to_proto(:default), do: {:ok, :DEFAULT}
 
-  defp versioning_intent_from_opts(opts) do
-    case Keyword.get(opts, :versioning_intent, :unspecified) do
-      nil -> {:ok, :UNSPECIFIED}
-      :unspecified -> {:ok, :UNSPECIFIED}
-      :compatible -> {:ok, :COMPATIBLE}
-      :default -> {:ok, :DEFAULT}
-      _ -> {:error, "unsupported continue-as-new versioning_intent"}
-    end
-  end
+  defp versioning_intent_to_proto(_intent),
+    do: {:error, "unsupported continue-as-new versioning_intent"}
 
-  defp continue_as_new_versioning_behavior_from_opts(opts) do
-    case Keyword.get(opts, :initial_versioning_behavior, :unspecified) do
-      nil -> {:ok, :CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_UNSPECIFIED}
-      :unspecified -> {:ok, :CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_UNSPECIFIED}
-      :auto_upgrade -> {:ok, :CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_AUTO_UPGRADE}
-      :use_ramping_version -> {:ok, :CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_USE_RAMPING_VERSION}
-      _ -> {:error, "unsupported continue-as-new initial_versioning_behavior"}
-    end
-  end
+  defp continue_as_new_versioning_behavior_to_proto(nil),
+    do: {:ok, :CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_UNSPECIFIED}
+
+  defp continue_as_new_versioning_behavior_to_proto(:unspecified),
+    do: {:ok, :CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_UNSPECIFIED}
+
+  defp continue_as_new_versioning_behavior_to_proto(:auto_upgrade),
+    do: {:ok, :CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_AUTO_UPGRADE}
+
+  defp continue_as_new_versioning_behavior_to_proto(:use_ramping_version),
+    do: {:ok, :CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_USE_RAMPING_VERSION}
+
+  defp continue_as_new_versioning_behavior_to_proto(_behavior),
+    do: {:error, "unsupported continue-as-new initial_versioning_behavior"}
 
   defp retry_state_to_proto(:in_progress), do: :RETRY_STATE_IN_PROGRESS
   defp retry_state_to_proto(:non_retryable_failure), do: :RETRY_STATE_NON_RETRYABLE_FAILURE
@@ -1063,16 +1017,6 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
       :nondeterminism -> :WORKFLOW_TASK_FAILED_CAUSE_NON_DETERMINISTIC_ERROR
       _ -> :WORKFLOW_TASK_FAILED_CAUSE_UNSPECIFIED
     end
-  end
-
-  defp find_option(opts, keys) do
-    Enum.find_value(keys, fn key ->
-      case Keyword.fetch(opts, key) do
-        {:ok, nil} -> nil
-        {:ok, value} -> value
-        :error -> nil
-      end
-    end)
   end
 
   defp non_empty(value, _default) when is_binary(value) and value != "", do: value

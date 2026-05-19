@@ -89,7 +89,7 @@ end
 defmodule Temporalex.Core.Pending do
   @moduledoc false
 
-  defstruct [:seq, :thread_id, :from, :op, cancel_requested?: false]
+  defstruct [:seq, :thread_id, :from, :op, :cancellation_type, cancel_requested?: false]
 end
 
 defmodule Temporalex.Core.ParallelScope do
@@ -183,9 +183,35 @@ defmodule Temporalex.Core.Job.RemoveFromCache do
   defstruct reason: nil, message: nil
 end
 
+defmodule Temporalex.Core.Command.RetryPolicy do
+  @moduledoc false
+
+  defstruct initial_interval_ms: nil,
+            backoff_coefficient: nil,
+            maximum_interval_ms: nil,
+            maximum_attempts: 0,
+            non_retryable_error_types: []
+end
+
 defmodule Temporalex.Core.Command.ScheduleActivity do
   @moduledoc false
-  defstruct [:seq, :thread_id, :activity_id, :type, input: [], opts: []]
+
+  defstruct [
+    :seq,
+    :thread_id,
+    :activity_id,
+    :type,
+    task_queue: nil,
+    input: [],
+    headers: %{},
+    schedule_to_close_timeout_ms: 60_000,
+    schedule_to_start_timeout_ms: nil,
+    start_to_close_timeout_ms: 60_000,
+    heartbeat_timeout_ms: nil,
+    retry_policy: nil,
+    cancellation_type: :wait_cancellation_completed,
+    do_not_eagerly_execute: false
+  ]
 end
 
 defmodule Temporalex.Core.Command.StartTimer do
@@ -220,7 +246,20 @@ end
 
 defmodule Temporalex.Core.Command.ContinueAsNew do
   @moduledoc false
-  defstruct [:input, :workflow_type, :task_queue, opts: []]
+
+  defstruct [
+    :input,
+    :workflow_type,
+    task_queue: nil,
+    workflow_run_timeout_ms: nil,
+    workflow_task_timeout_ms: nil,
+    memo: %{},
+    headers: %{},
+    search_attributes: nil,
+    retry_policy: nil,
+    versioning_intent: :unspecified,
+    initial_versioning_behavior: :unspecified
+  ]
 end
 
 defmodule Temporalex.Core.Command.CancelWorkflow do
