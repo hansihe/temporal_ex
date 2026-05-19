@@ -4,8 +4,11 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
   alias Temporalex.Backend.TemporalCore.PayloadConverter
   alias Temporalex.Backend.TemporalCore.Proto.Schema
   alias Temporalex.Core.ActivityCompletion
+  alias Temporalex.Core.ActivityTask
+  alias Temporalex.Core.Activation
   alias Temporalex.Core.Command
   alias Temporalex.Core.Completion
+  alias Temporalex.Core.Job
   alias Temporalex.Failure
 
   @activity_task_completion :"coresdk.ActivityTaskCompletion"
@@ -15,14 +18,14 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
   @workflow_activation_completion :"coresdk.workflow_completion.WorkflowActivationCompletion"
 
   def workflow_activation_from_bytes(bytes) when is_binary(bytes) do
-    with {:ok, proto} <- decode(@workflow_activation, bytes),
+    with {:ok, proto} <- decode(@workflow_activation, bytes, defaults: true),
          {:ok, activation} <- workflow_activation_from_proto(proto) do
       {:ok, activation}
     end
   end
 
   def activity_task_from_bytes(bytes) when is_binary(bytes) do
-    with {:ok, proto} <- decode(@activity_task, bytes),
+    with {:ok, proto} <- decode(@activity_task, bytes, defaults: true),
          {:ok, task} <- activity_task_from_proto(proto) do
       {:ok, task}
     end
@@ -62,8 +65,8 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
     error -> {:error, Exception.message(error)}
   end
 
-  defp decode(message, bytes) do
-    case Schema.decode(message, bytes) do
+  defp decode(message, bytes, opts) do
+    case Schema.decode(message, bytes, opts) do
       {:ok, proto} -> {:ok, proto}
       {:error, error} -> {:error, format_error(error)}
     end
@@ -74,17 +77,20 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
   defp workflow_activation_from_proto(proto) do
     with {:ok, jobs} <- activation_jobs_from_proto(Map.get(proto, :jobs, [])) do
       {:ok,
-       %Temporalex.Core.Activation{
-         run_id: Map.get(proto, :run_id),
-         timestamp: timestamp_to_datetime(Map.get(proto, :timestamp)),
-         is_replaying: Map.get(proto, :is_replaying, false),
-         history_length: Map.get(proto, :history_length, 0),
-         history_size_bytes: Map.get(proto, :history_size_bytes),
-         continue_as_new_suggested: Map.get(proto, :continue_as_new_suggested, false),
-         available_internal_flags: Map.get(proto, :available_internal_flags, []),
-         deployment_version: nil,
-         jobs: jobs
-       }}
+       struct!(
+         Activation,
+         proto
+         |> Map.take([
+           :run_id,
+           :timestamp,
+           :is_replaying,
+           :history_length,
+           :history_size_bytes,
+           :continue_as_new_suggested,
+           :available_internal_flags
+         ])
+         |> Map.put(:jobs, jobs)
+       )}
     end
   end
 
@@ -101,105 +107,148 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
     end
   end
 
-  defp activation_job_from_proto(%{variant: {:initialize_workflow, init}}) do
+  defp activation_job_from_proto(%{
+         variant:
+           {:initialize_workflow,
+            %{
+              workflow_type: workflow_type,
+              workflow_id: workflow_id,
+              attempt: attempt,
+              identity: identity,
+              first_execution_run_id: first_execution_run_id,
+              arguments: proto_arguments,
+              headers: proto_headers,
+              randomness_seed: randomness_seed
+            }}
+       }) do
     workflow_info = %{
-      workflow_id: Map.get(init, :workflow_id, ""),
-      workflow_type: Map.get(init, :workflow_type, ""),
-      attempt: Map.get(init, :attempt, 0),
-      identity: Map.get(init, :identity, ""),
-      run_id: Map.get(init, :first_execution_run_id, "")
+      workflow_id: workflow_id,
+      workflow_type: workflow_type,
+      attempt: attempt,
+      identity: identity,
+      run_id: first_execution_run_id
     }
 
-    with {:ok, arguments} <- payloads_to_terms(Map.get(init, :arguments, [])),
-         {:ok, headers} <- PayloadConverter.payload_map_to_term(Map.get(init, :headers, %{})) do
+    with {:ok, arguments} <- payloads_to_terms(proto_arguments),
+         {:ok, headers} <- PayloadConverter.payload_map_to_term(proto_headers) do
       {:ok,
-       %Temporalex.Core.Job.InitializeWorkflow{
-         workflow_type: Map.get(init, :workflow_type, ""),
-         workflow_id: Map.get(init, :workflow_id, ""),
+       %Job.InitializeWorkflow{
+         workflow_type: workflow_type,
+         workflow_id: workflow_id,
          arguments: arguments,
          headers: headers,
          workflow_info: workflow_info,
-         randomness_seed: Map.get(init, :randomness_seed, 0)
+         randomness_seed: randomness_seed
        }}
     end
   end
 
-  defp activation_job_from_proto(%{variant: {:fire_timer, timer}}) do
-    {:ok, %Temporalex.Core.Job.TimerFired{seq: Map.get(timer, :seq, 0)}}
+  defp activation_job_from_proto(%{variant: {:fire_timer, %{seq: seq}}}) do
+    {:ok, %Job.TimerFired{seq: seq}}
   end
 
-  defp activation_job_from_proto(%{variant: {:resolve_activity, resolution}}) do
+  defp activation_job_from_proto(%{variant: {:resolve_activity, %{seq: seq} = resolution}}) do
     with {:ok, result} <- activity_resolution_from_proto(Map.get(resolution, :result)) do
       {:ok,
-       %Temporalex.Core.Job.ActivityResolved{
-         seq: Map.get(resolution, :seq, 0),
+       %Job.ActivityResolved{
+         seq: seq,
          result: result
        }}
     end
   end
 
-  defp activation_job_from_proto(%{variant: {:update_random_seed, seed}}) do
-    {:ok,
-     %Temporalex.Core.Job.UpdateRandomSeed{
-       randomness_seed: Map.get(seed, :randomness_seed, 0)
-     }}
+  defp activation_job_from_proto(%{
+         variant: {:update_random_seed, %{randomness_seed: randomness_seed}}
+       }) do
+    {:ok, %Job.UpdateRandomSeed{randomness_seed: randomness_seed}}
   end
 
-  defp activation_job_from_proto(%{variant: {:query_workflow, query}}) do
-    with {:ok, args} <- payloads_to_terms(Map.get(query, :arguments, [])),
-         {:ok, headers} <- PayloadConverter.payload_map_to_term(Map.get(query, :headers, %{})) do
+  defp activation_job_from_proto(%{
+         variant:
+           {:query_workflow,
+            %{
+              query_id: query_id,
+              query_type: query_type,
+              arguments: proto_arguments,
+              headers: proto_headers
+            }}
+       }) do
+    with {:ok, args} <- payloads_to_terms(proto_arguments),
+         {:ok, headers} <- PayloadConverter.payload_map_to_term(proto_headers) do
       {:ok,
-       %Temporalex.Core.Job.QueryReceived{
-         query_id: Map.get(query, :query_id, ""),
-         query_type: Map.get(query, :query_type, ""),
+       %Job.QueryReceived{
+         query_id: query_id,
+         query_type: query_type,
          args: args,
          headers: headers
        }}
     end
   end
 
-  defp activation_job_from_proto(%{variant: {:cancel_workflow, cancel}}) do
-    {:ok, %Temporalex.Core.Job.CancelWorkflow{reason: Map.get(cancel, :reason, "")}}
+  defp activation_job_from_proto(%{variant: {:cancel_workflow, %{reason: reason}}}) do
+    {:ok, %Job.CancelWorkflow{reason: reason}}
   end
 
-  defp activation_job_from_proto(%{variant: {:signal_workflow, signal}}) do
-    with {:ok, args} <- payloads_to_terms(Map.get(signal, :input, [])),
-         {:ok, headers} <- PayloadConverter.payload_map_to_term(Map.get(signal, :headers, %{})) do
+  defp activation_job_from_proto(%{
+         variant:
+           {:signal_workflow,
+            %{
+              signal_name: signal_name,
+              input: proto_input,
+              headers: proto_headers,
+              identity: identity
+            }}
+       }) do
+    with {:ok, args} <- payloads_to_terms(proto_input),
+         {:ok, headers} <- PayloadConverter.payload_map_to_term(proto_headers) do
       {:ok,
-       %Temporalex.Core.Job.SignalReceived{
-         name: Map.get(signal, :signal_name, ""),
+       %Job.SignalReceived{
+         name: signal_name,
          args: args,
          headers: headers,
-         identity: Map.get(signal, :identity, "")
+         identity: identity
        }}
     end
   end
 
-  defp activation_job_from_proto(%{variant: {:notify_has_patch, patch}}) do
-    {:ok, %Temporalex.Core.Job.NotifyPatch{id: Map.get(patch, :patch_id, "")}}
+  defp activation_job_from_proto(%{variant: {:notify_has_patch, %{patch_id: patch_id}}}) do
+    {:ok, %Job.NotifyPatch{id: patch_id}}
   end
 
-  defp activation_job_from_proto(%{variant: {:do_update, update}}) do
-    with {:ok, args} <- payloads_to_terms(Map.get(update, :input, [])),
-         {:ok, headers} <- PayloadConverter.payload_map_to_term(Map.get(update, :headers, %{})) do
+  defp activation_job_from_proto(%{
+         variant:
+           {:do_update,
+            %{
+              id: id,
+              protocol_instance_id: protocol_instance_id,
+              name: name,
+              input: proto_input,
+              headers: proto_headers,
+              run_validator: run_validator
+            }}
+       }) do
+    with {:ok, args} <- payloads_to_terms(proto_input),
+         {:ok, headers} <- PayloadConverter.payload_map_to_term(proto_headers) do
       {:ok,
-       %Temporalex.Core.Job.UpdateReceived{
-         id: Map.get(update, :id, ""),
-         protocol_instance_id: Map.get(update, :protocol_instance_id, ""),
-         name: Map.get(update, :name, ""),
+       %Job.UpdateReceived{
+         id: id,
+         protocol_instance_id: protocol_instance_id,
+         name: name,
          args: args,
          headers: headers,
          meta: nil,
-         run_validator: Map.get(update, :run_validator, false)
+         run_validator: run_validator
        }}
     end
   end
 
-  defp activation_job_from_proto(%{variant: {:remove_from_cache, eviction}}) do
+  defp activation_job_from_proto(%{
+         variant: {:remove_from_cache, %{reason: reason, message: message}}
+       }) do
     {:ok,
-     %Temporalex.Core.Job.RemoveFromCache{
-       reason: eviction_reason_to_atom(Map.get(eviction, :reason, :UNSPECIFIED)),
-       message: Map.get(eviction, :message, "")
+     %Job.RemoveFromCache{
+       reason: eviction_reason_to_atom(reason),
+       message: message
      }}
   end
 
@@ -236,33 +285,46 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
      {:backoff,
       %{
         attempt: Map.get(backoff, :attempt, 0),
-        timeout: duration_to_millis(Map.get(backoff, :backoff_duration))
+        timeout: Map.get(backoff, :backoff_duration, 0)
       }}}
   end
 
   defp activity_resolution_from_proto(nil), do: {:error, "activity resolution missing result"}
   defp activity_resolution_from_proto(_resolution), do: {:error, "activity resolution empty"}
 
-  defp activity_task_from_proto(%{task_token: task_token, variant: {:start, start}}) do
+  defp activity_task_from_proto(%{
+         task_token: task_token,
+         variant:
+           {:start,
+            %{
+              workflow_namespace: workflow_namespace,
+              workflow_type: workflow_type,
+              activity_id: activity_id,
+              activity_type: activity_type,
+              header_fields: proto_headers,
+              input: proto_input,
+              attempt: attempt,
+              is_local: is_local
+            } = start}
+       }) do
     execution = Map.get(start, :workflow_execution, %{})
 
-    with {:ok, input} <- payloads_to_terms(Map.get(start, :input, [])),
-         {:ok, headers} <-
-           PayloadConverter.payload_map_to_term(Map.get(start, :header_fields, %{})) do
+    with {:ok, input} <- payloads_to_terms(proto_input),
+         {:ok, headers} <- PayloadConverter.payload_map_to_term(proto_headers) do
       {:ok,
-       %Temporalex.Core.ActivityTask{
+       %ActivityTask{
          task_token: task_token,
-         activity_id: Map.get(start, :activity_id, ""),
-         activity_type: Map.get(start, :activity_type, ""),
+         activity_id: activity_id,
+         activity_type: activity_type,
          workflow_id: Map.get(execution, :workflow_id, ""),
          run_id: Map.get(execution, :run_id, ""),
-         workflow_type: Map.get(start, :workflow_type, ""),
-         namespace: Map.get(start, :workflow_namespace, ""),
+         workflow_type: workflow_type,
+         namespace: workflow_namespace,
          task_queue: nil,
          input: input,
-         attempt: Map.get(start, :attempt, 0),
-         heartbeat_timeout: nullable_duration_millis(Map.get(start, :heartbeat_timeout)),
-         is_local: Map.get(start, :is_local, false),
+         attempt: attempt,
+         heartbeat_timeout: Map.get(start, :heartbeat_timeout),
+         is_local: is_local,
          headers: headers,
          variant: :start,
          cancel_reason: nil
@@ -272,7 +334,7 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
 
   defp activity_task_from_proto(%{task_token: task_token, variant: {:cancel, cancel}}) do
     {:ok,
-     %Temporalex.Core.ActivityTask{
+     %ActivityTask{
        task_token: task_token,
        variant: :cancel,
        cancel_reason: activity_cancel_reason(Map.get(cancel, :reason, :NOT_FOUND))
@@ -289,88 +351,91 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
 
   defp failure_from_proto(failure) do
     with {:ok, cause} <- failure_from_proto(Map.get(failure, :cause)) do
+      base_attrs = failure_base_attrs(failure, cause)
+
       case Map.get(failure, :failure_info) do
         {:application_failure_info, info} ->
           with {:ok, details} <- payloads_to_terms_option(Map.get(info, :details)) do
             {:ok,
-             %Failure.ApplicationError{
-               message: Map.get(failure, :message, ""),
-               source: Map.get(failure, :source, ""),
-               stack_trace: Map.get(failure, :stack_trace, ""),
-               type: Map.get(info, :type, ""),
-               details: details,
-               retryable?: not Map.get(info, :non_retryable, false),
-               cause: cause
-             }}
+             struct!(
+               Failure.ApplicationError,
+               Map.merge(base_attrs, %{
+                 type: info.type,
+                 details: details,
+                 retryable?: not info.non_retryable
+               })
+             )}
           end
 
         {:canceled_failure_info, info} ->
           with {:ok, details} <- payloads_to_terms_option(Map.get(info, :details)) do
             {:ok,
-             %Failure.CancelledError{
-               message: Map.get(failure, :message, ""),
-               source: Map.get(failure, :source, ""),
-               stack_trace: Map.get(failure, :stack_trace, ""),
-               identity: Map.get(info, :identity, ""),
-               details: details,
-               cause: cause
-             }}
+             struct!(
+               Failure.CancelledError,
+               Map.merge(base_attrs, %{
+                 identity: info.identity,
+                 details: details
+               })
+             )}
           end
 
         {:timeout_failure_info, info} ->
           with {:ok, last_heartbeat_details} <-
                  payloads_to_terms_option(Map.get(info, :last_heartbeat_details)) do
             {:ok,
-             %Failure.TimeoutError{
-               message: Map.get(failure, :message, ""),
-               source: Map.get(failure, :source, ""),
-               stack_trace: Map.get(failure, :stack_trace, ""),
-               timeout_type: timeout_type_from_proto(Map.get(info, :timeout_type)),
-               last_heartbeat_details: last_heartbeat_details,
-               cause: cause
-             }}
+             struct!(
+               Failure.TimeoutError,
+               Map.merge(base_attrs, %{
+                 timeout_type: timeout_type_from_proto(info.timeout_type),
+                 last_heartbeat_details: last_heartbeat_details
+               })
+             )}
           end
 
         {:activity_failure_info, info} ->
           {:ok,
-           %Failure.ActivityError{
-             message: Map.get(failure, :message, ""),
-             source: Map.get(failure, :source, ""),
-             stack_trace: Map.get(failure, :stack_trace, ""),
-             identity: Map.get(info, :identity, ""),
-             activity_id: Map.get(info, :activity_id, ""),
-             activity_type: get_in(info, [:activity_type, :name]) || "",
-             retry_state: retry_state_from_proto(Map.get(info, :retry_state)),
-             cause: cause
-           }}
+           struct!(
+             Failure.ActivityError,
+             Map.merge(base_attrs, %{
+               identity: info.identity,
+               activity_id: info.activity_id,
+               activity_type: Map.get(info, :activity_type, ""),
+               retry_state: retry_state_from_proto(info.retry_state)
+             })
+           )}
 
         {:child_workflow_execution_failure_info, info} ->
           execution = Map.get(info, :workflow_execution, %{})
 
           {:ok,
-           %Failure.WorkflowExecutionError{
-             message: Map.get(failure, :message, ""),
-             source: Map.get(failure, :source, ""),
-             stack_trace: Map.get(failure, :stack_trace, ""),
-             namespace: Map.get(info, :namespace, ""),
-             workflow_id: Map.get(execution, :workflow_id, ""),
-             run_id: Map.get(execution, :run_id, ""),
-             workflow_type: get_in(info, [:workflow_type, :name]) || "",
-             retry_state: retry_state_from_proto(Map.get(info, :retry_state)),
-             cause: cause
-           }}
+           struct!(
+             Failure.WorkflowExecutionError,
+             Map.merge(base_attrs, %{
+               namespace: info.namespace,
+               workflow_id: Map.get(execution, :workflow_id, ""),
+               run_id: Map.get(execution, :run_id, ""),
+               workflow_type: Map.get(info, :workflow_type, ""),
+               retry_state: retry_state_from_proto(info.retry_state)
+             })
+           )}
 
         other ->
           {:ok,
-           %Failure.UnknownError{
-             message: Map.get(failure, :message, ""),
-             source: Map.get(failure, :source, ""),
-             stack_trace: Map.get(failure, :stack_trace, ""),
-             failure_type: failure_info_type(other),
-             cause: cause
-           }}
+           struct!(
+             Failure.UnknownError,
+             Map.merge(base_attrs, %{failure_type: failure_info_type(other)})
+           )}
       end
     end
+  end
+
+  defp failure_base_attrs(%{message: message, source: source, stack_trace: stack_trace}, cause) do
+    %{
+      message: message,
+      source: source,
+      stack_trace: stack_trace,
+      cause: cause
+    }
   end
 
   defp payloads_to_terms(payloads), do: PayloadConverter.payloads_to_terms(payloads || [])
@@ -380,30 +445,6 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
 
   defp payloads_to_terms_option(%{payloads: payloads}) do
     payloads_to_terms(payloads)
-  end
-
-  defp timestamp_to_datetime(nil), do: nil
-
-  defp timestamp_to_datetime(timestamp) do
-    seconds = Map.get(timestamp, :seconds, 0)
-    nanos = max(Map.get(timestamp, :nanos, 0), 0)
-
-    seconds
-    |> DateTime.from_unix!(:second)
-    |> Map.put(:microsecond, {div(nanos, 1000), 6})
-  rescue
-    _error -> ~U[1970-01-01 00:00:00Z]
-  end
-
-  defp nullable_duration_millis(nil), do: nil
-  defp nullable_duration_millis(duration), do: duration_to_millis(duration)
-
-  defp duration_to_millis(nil), do: 0
-
-  defp duration_to_millis(duration) do
-    seconds = max(Map.get(duration, :seconds, 0), 0)
-    nanos = max(Map.get(duration, :nanos, 0), 0)
-    seconds * 1000 + div(nanos, 1_000_000)
   end
 
   defp eviction_reason_to_atom(:CACHE_FULL), do: :cache_full
@@ -791,8 +832,7 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
         {:activity_failure_info,
          compact(%{
            identity: error.identity || "",
-           activity_type:
-             if(blank?(error.activity_type), do: nil, else: %{name: error.activity_type}),
+           activity_type: if(blank?(error.activity_type), do: nil, else: error.activity_type),
            activity_id: error.activity_id || "",
            retry_state: retry_state_to_proto(error.retry_state)
          })}
@@ -814,8 +854,7 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
                do: nil,
                else: %{workflow_id: error.workflow_id || "", run_id: error.run_id || ""}
              ),
-           workflow_type:
-             if(blank?(error.workflow_type), do: nil, else: %{name: error.workflow_type}),
+           workflow_type: if(blank?(error.workflow_type), do: nil, else: error.workflow_type),
            retry_state: retry_state_to_proto(error.retry_state)
          })}
     })
@@ -883,7 +922,7 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
 
   defp duration_from_ms(ms, option_name) do
     with {:ok, ms} <- non_negative_millis(ms, option_name) do
-      {:ok, %{seconds: div(ms, 1000), nanos: rem(ms, 1000) * 1_000_000}}
+      {:ok, ms}
     end
   end
 
