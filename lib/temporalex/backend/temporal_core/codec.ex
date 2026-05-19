@@ -17,6 +17,70 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
   @workflow_activation :"coresdk.workflow_activation.WorkflowActivation"
   @workflow_activation_completion :"coresdk.workflow_completion.WorkflowActivationCompletion"
 
+  @eviction_reasons %{
+    CACHE_FULL: :cache_full,
+    CACHE_MISS: :cache_miss,
+    NONDETERMINISM: :nondeterminism,
+    LANG_FAIL: :lang_fail,
+    LANG_REQUESTED: :lang_requested,
+    TASK_NOT_FOUND: :task_not_found,
+    UNHANDLED_COMMAND: :unhandled_command,
+    FATAL: :fatal,
+    PAGINATION_OR_HISTORY_FETCH: :pagination_or_history_fetch,
+    WORKFLOW_EXECUTION_ENDING: :workflow_execution_ending
+  }
+  @activity_cancel_reasons %{
+    CANCELLED: :cancelled,
+    TIMED_OUT: :timeout,
+    WORKER_SHUTDOWN: :shutdown
+  }
+  @retry_states %{
+    RETRY_STATE_IN_PROGRESS: :in_progress,
+    RETRY_STATE_NON_RETRYABLE_FAILURE: :non_retryable_failure,
+    RETRY_STATE_TIMEOUT: :timeout,
+    RETRY_STATE_MAXIMUM_ATTEMPTS_REACHED: :maximum_attempts_reached,
+    RETRY_STATE_RETRY_POLICY_NOT_SET: :retry_policy_not_set,
+    RETRY_STATE_INTERNAL_SERVER_ERROR: :internal_server_error,
+    RETRY_STATE_CANCEL_REQUESTED: :cancel_requested
+  }
+  @retry_states_to_proto Map.new(@retry_states, fn {proto, term} -> {term, proto} end)
+  @timeout_types %{
+    TIMEOUT_TYPE_START_TO_CLOSE: :start_to_close,
+    TIMEOUT_TYPE_SCHEDULE_TO_START: :schedule_to_start,
+    TIMEOUT_TYPE_SCHEDULE_TO_CLOSE: :schedule_to_close,
+    TIMEOUT_TYPE_HEARTBEAT: :heartbeat
+  }
+  @timeout_types_to_proto Map.new(@timeout_types, fn {proto, term} -> {term, proto} end)
+  @failure_info_types %{
+    timeout_failure_info: :timeout_failure,
+    canceled_failure_info: :cancelled_failure,
+    terminated_failure_info: :terminated_failure,
+    server_failure_info: :server_failure,
+    reset_workflow_failure_info: :reset_workflow_failure,
+    activity_failure_info: :activity_failure,
+    child_workflow_execution_failure_info: :child_workflow_failure,
+    nexus_operation_execution_failure_info: :nexus_operation_failure,
+    nexus_handler_failure_info: :nexus_handler_failure,
+    application_failure_info: :failed
+  }
+  @activity_cancellation_types_to_proto %{
+    try_cancel: :TRY_CANCEL,
+    wait_cancellation_completed: :WAIT_CANCELLATION_COMPLETED,
+    abandon: :ABANDON
+  }
+  @versioning_intents_to_proto %{
+    nil => :UNSPECIFIED,
+    unspecified: :UNSPECIFIED,
+    compatible: :COMPATIBLE,
+    default: :DEFAULT
+  }
+  @continue_as_new_versioning_behaviors_to_proto %{
+    nil => :CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_UNSPECIFIED,
+    unspecified: :CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_UNSPECIFIED,
+    auto_upgrade: :CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_AUTO_UPGRADE,
+    use_ramping_version: :CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_USE_RAMPING_VERSION
+  }
+
   def workflow_activation_from_bytes(bytes) when is_binary(bytes) do
     with {:ok, proto} <- decode(@workflow_activation, bytes, defaults: true),
          {:ok, activation} <- workflow_activation_from_proto(proto) do
@@ -95,16 +159,7 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
   end
 
   defp activation_jobs_from_proto(jobs) when is_list(jobs) do
-    Enum.reduce_while(jobs, {:ok, []}, fn job, {:ok, acc} ->
-      case activation_job_from_proto(job) do
-        {:ok, job} -> {:cont, {:ok, [job | acc]}}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
-    |> case do
-      {:ok, jobs} -> {:ok, Enum.reverse(jobs)}
-      {:error, reason} -> {:error, reason}
-    end
+    map_ok(jobs, &activation_job_from_proto/1)
   end
 
   defp activation_job_from_proto(%{
@@ -116,10 +171,8 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
               attempt: attempt,
               identity: identity,
               first_execution_run_id: first_execution_run_id,
-              arguments: proto_arguments,
-              headers: proto_headers,
               randomness_seed: randomness_seed
-            }}
+            } = init}
        }) do
     workflow_info = %{
       workflow_id: workflow_id,
@@ -129,8 +182,7 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
       run_id: first_execution_run_id
     }
 
-    with {:ok, arguments} <- payloads_to_terms(proto_arguments),
-         {:ok, headers} <- PayloadConverter.payload_map_to_term(proto_headers) do
+    with_payloads_and_headers(init, :arguments, fn arguments, headers ->
       {:ok,
        %Job.InitializeWorkflow{
          workflow_type: workflow_type,
@@ -140,7 +192,7 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
          workflow_info: workflow_info,
          randomness_seed: randomness_seed
        }}
-    end
+    end)
   end
 
   defp activation_job_from_proto(%{variant: {:fire_timer, %{seq: seq}}}) do
@@ -168,13 +220,10 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
            {:query_workflow,
             %{
               query_id: query_id,
-              query_type: query_type,
-              arguments: proto_arguments,
-              headers: proto_headers
-            }}
+              query_type: query_type
+            } = query}
        }) do
-    with {:ok, args} <- payloads_to_terms(proto_arguments),
-         {:ok, headers} <- PayloadConverter.payload_map_to_term(proto_headers) do
+    with_payloads_and_headers(query, :arguments, fn args, headers ->
       {:ok,
        %Job.QueryReceived{
          query_id: query_id,
@@ -182,7 +231,7 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
          args: args,
          headers: headers
        }}
-    end
+    end)
   end
 
   defp activation_job_from_proto(%{variant: {:cancel_workflow, %{reason: reason}}}) do
@@ -194,13 +243,10 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
            {:signal_workflow,
             %{
               signal_name: signal_name,
-              input: proto_input,
-              headers: proto_headers,
               identity: identity
-            }}
+            } = signal}
        }) do
-    with {:ok, args} <- payloads_to_terms(proto_input),
-         {:ok, headers} <- PayloadConverter.payload_map_to_term(proto_headers) do
+    with_payloads_and_headers(signal, :input, fn args, headers ->
       {:ok,
        %Job.SignalReceived{
          name: signal_name,
@@ -208,7 +254,7 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
          headers: headers,
          identity: identity
        }}
-    end
+    end)
   end
 
   defp activation_job_from_proto(%{variant: {:notify_has_patch, %{patch_id: patch_id}}}) do
@@ -222,13 +268,10 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
               id: id,
               protocol_instance_id: protocol_instance_id,
               name: name,
-              input: proto_input,
-              headers: proto_headers,
               run_validator: run_validator
-            }}
+            } = update}
        }) do
-    with {:ok, args} <- payloads_to_terms(proto_input),
-         {:ok, headers} <- PayloadConverter.payload_map_to_term(proto_headers) do
+    with_payloads_and_headers(update, :input, fn args, headers ->
       {:ok,
        %Job.UpdateReceived{
          id: id,
@@ -239,7 +282,7 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
          meta: nil,
          run_validator: run_validator
        }}
-    end
+    end)
   end
 
   defp activation_job_from_proto(%{
@@ -440,6 +483,13 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
 
   defp payloads_to_terms(payloads), do: PayloadConverter.payloads_to_terms(payloads || [])
 
+  defp with_payloads_and_headers(proto, payload_key, fun) do
+    with {:ok, args} <- payloads_to_terms(Map.get(proto, payload_key, [])),
+         {:ok, headers} <- PayloadConverter.payload_map_to_term(Map.get(proto, :headers, %{})) do
+      fun.(args, headers)
+    end
+  end
+
   defp payloads_to_terms_option(nil), do: {:ok, []}
   defp payloads_to_terms_option(%{} = payloads) when map_size(payloads) == 0, do: {:ok, []}
 
@@ -447,54 +497,26 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
     payloads_to_terms(payloads)
   end
 
-  defp eviction_reason_to_atom(:CACHE_FULL), do: :cache_full
-  defp eviction_reason_to_atom(:CACHE_MISS), do: :cache_miss
-  defp eviction_reason_to_atom(:NONDETERMINISM), do: :nondeterminism
-  defp eviction_reason_to_atom(:LANG_FAIL), do: :lang_fail
-  defp eviction_reason_to_atom(:LANG_REQUESTED), do: :lang_requested
-  defp eviction_reason_to_atom(:TASK_NOT_FOUND), do: :task_not_found
-  defp eviction_reason_to_atom(:UNHANDLED_COMMAND), do: :unhandled_command
-  defp eviction_reason_to_atom(:FATAL), do: :fatal
-  defp eviction_reason_to_atom(:PAGINATION_OR_HISTORY_FETCH), do: :pagination_or_history_fetch
-  defp eviction_reason_to_atom(:WORKFLOW_EXECUTION_ENDING), do: :workflow_execution_ending
-  defp eviction_reason_to_atom(_), do: :unspecified
+  defp map_ok(list, fun) when is_list(list) do
+    Enum.reduce_while(list, {:ok, []}, fn item, {:ok, acc} ->
+      case fun.(item) do
+        {:ok, mapped} -> {:cont, {:ok, [mapped | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, mapped} -> {:ok, Enum.reverse(mapped)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
-  defp activity_cancel_reason(:CANCELLED), do: :cancelled
-  defp activity_cancel_reason(:TIMED_OUT), do: :timeout
-  defp activity_cancel_reason(:WORKER_SHUTDOWN), do: :shutdown
-  defp activity_cancel_reason(_), do: :cancel
+  defp lookup(map, key, default), do: Map.get(map, key, default)
 
-  defp retry_state_from_proto(:RETRY_STATE_IN_PROGRESS), do: :in_progress
-  defp retry_state_from_proto(:RETRY_STATE_NON_RETRYABLE_FAILURE), do: :non_retryable_failure
-  defp retry_state_from_proto(:RETRY_STATE_TIMEOUT), do: :timeout
-
-  defp retry_state_from_proto(:RETRY_STATE_MAXIMUM_ATTEMPTS_REACHED),
-    do: :maximum_attempts_reached
-
-  defp retry_state_from_proto(:RETRY_STATE_RETRY_POLICY_NOT_SET), do: :retry_policy_not_set
-  defp retry_state_from_proto(:RETRY_STATE_INTERNAL_SERVER_ERROR), do: :internal_server_error
-  defp retry_state_from_proto(:RETRY_STATE_CANCEL_REQUESTED), do: :cancel_requested
-  defp retry_state_from_proto(_), do: :unspecified
-
-  defp timeout_type_from_proto(:TIMEOUT_TYPE_START_TO_CLOSE), do: :start_to_close
-  defp timeout_type_from_proto(:TIMEOUT_TYPE_SCHEDULE_TO_START), do: :schedule_to_start
-  defp timeout_type_from_proto(:TIMEOUT_TYPE_SCHEDULE_TO_CLOSE), do: :schedule_to_close
-  defp timeout_type_from_proto(:TIMEOUT_TYPE_HEARTBEAT), do: :heartbeat
-  defp timeout_type_from_proto(_), do: :unspecified
-
-  defp failure_info_type({:timeout_failure_info, _}), do: :timeout_failure
-  defp failure_info_type({:canceled_failure_info, _}), do: :cancelled_failure
-  defp failure_info_type({:terminated_failure_info, _}), do: :terminated_failure
-  defp failure_info_type({:server_failure_info, _}), do: :server_failure
-  defp failure_info_type({:reset_workflow_failure_info, _}), do: :reset_workflow_failure
-  defp failure_info_type({:activity_failure_info, _}), do: :activity_failure
-  defp failure_info_type({:child_workflow_execution_failure_info, _}), do: :child_workflow_failure
-
-  defp failure_info_type({:nexus_operation_execution_failure_info, _}),
-    do: :nexus_operation_failure
-
-  defp failure_info_type({:nexus_handler_failure_info, _}), do: :nexus_handler_failure
-  defp failure_info_type({:application_failure_info, _}), do: :failed
+  defp eviction_reason_to_atom(reason), do: lookup(@eviction_reasons, reason, :unspecified)
+  defp activity_cancel_reason(reason), do: lookup(@activity_cancel_reasons, reason, :cancel)
+  defp retry_state_from_proto(state), do: lookup(@retry_states, state, :unspecified)
+  defp timeout_type_from_proto(type), do: lookup(@timeout_types, type, :unspecified)
+  defp failure_info_type({type, _}), do: lookup(@failure_info_types, type, :unknown_failure)
   defp failure_info_type(_), do: :unknown_failure
 
   defp workflow_completion_to_proto(
@@ -537,16 +559,7 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
   end
 
   defp commands_to_proto(commands, task_queue) when is_list(commands) do
-    Enum.reduce_while(commands, {:ok, []}, fn command, {:ok, acc} ->
-      case command_to_proto(command, task_queue) do
-        {:ok, proto} -> {:cont, {:ok, [proto | acc]}}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
-    |> case do
-      {:ok, commands} -> {:ok, Enum.reverse(commands)}
-      {:error, reason} -> {:error, reason}
-    end
+    map_ok(commands, &command_to_proto(&1, task_queue))
   end
 
   defp command_to_proto(%Command.StartTimer{seq: seq, duration_ms: duration_ms}, _task_queue) do
@@ -762,94 +775,99 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
 
   defp update_response_to_proto(_response), do: {:error, "unsupported update response"}
 
+  defp failure_proto_base(error, default_message, opts) do
+    message =
+      case Keyword.get(opts, :message, :non_empty) do
+        :nil_only -> error.message || default_message
+        :non_empty -> non_empty(error.message, default_message)
+      end
+
+    compact(%{
+      message: message,
+      source: error.source || "Temporalex",
+      stack_trace: error.stack_trace || "",
+      cause: maybe_failure(error.cause, "Temporalex caused failure")
+    })
+  end
+
+  defp failure_proto(error, default_message, failure_info, opts \\ []) do
+    Map.put(failure_proto_base(error, default_message, opts), :failure_info, failure_info)
+  end
+
   defp failure_to_proto({:exception, error, _stacktrace}, default_message) do
     failure_to_proto(error, default_message)
   end
 
   defp failure_to_proto(%Failure.ApplicationError{} = error, default_message) do
-    compact(%{
-      message: non_empty(error.message, default_message),
-      source: error.source || "Temporalex",
-      stack_trace: error.stack_trace || "",
-      cause: maybe_failure(error.cause, "Temporalex caused failure"),
-      failure_info:
-        {:application_failure_info,
-         %{
-           type: non_empty(error.type, "Temporalex.ApplicationError"),
-           non_retryable: not error.retryable?,
-           details: %{payloads: PayloadConverter.term_to_payloads_list(error.details || [])}
-         }}
-    })
+    failure_proto(
+      error,
+      default_message,
+      {:application_failure_info,
+       %{
+         type: non_empty(error.type, "Temporalex.ApplicationError"),
+         non_retryable: not error.retryable?,
+         details: %{payloads: PayloadConverter.term_to_payloads_list(error.details || [])}
+       }}
+    )
   end
 
   defp failure_to_proto(%Failure.CancelledError{} = error, _default_message) do
-    compact(%{
-      message: error.message || "Temporalex activity cancelled",
-      source: error.source || "Temporalex",
-      stack_trace: error.stack_trace || "",
-      cause: maybe_failure(error.cause, "Temporalex caused failure"),
-      failure_info:
-        {:canceled_failure_info,
-         compact(%{
-           details: %{payloads: PayloadConverter.term_to_payloads_list(error.details || [])},
-           identity: error.identity || ""
-         })}
-    })
+    failure_proto(
+      error,
+      "Temporalex activity cancelled",
+      {:canceled_failure_info,
+       compact(%{
+         details: %{payloads: PayloadConverter.term_to_payloads_list(error.details || [])},
+         identity: error.identity || ""
+       })},
+      message: :nil_only
+    )
   end
 
   defp failure_to_proto(%Failure.TimeoutError{} = error, default_message) do
-    compact(%{
-      message: non_empty(error.message, default_message),
-      source: error.source || "Temporalex",
-      stack_trace: error.stack_trace || "",
-      cause: maybe_failure(error.cause, "Temporalex caused failure"),
-      failure_info:
-        {:timeout_failure_info,
-         %{
-           timeout_type: timeout_type_to_proto(error.timeout_type),
-           last_heartbeat_details: %{
-             payloads: PayloadConverter.term_to_payloads_list(error.last_heartbeat_details || [])
-           }
-         }}
-    })
+    failure_proto(
+      error,
+      default_message,
+      {:timeout_failure_info,
+       %{
+         timeout_type: timeout_type_to_proto(error.timeout_type),
+         last_heartbeat_details: %{
+           payloads: PayloadConverter.term_to_payloads_list(error.last_heartbeat_details || [])
+         }
+       }}
+    )
   end
 
   defp failure_to_proto(%Failure.ActivityError{} = error, default_message) do
-    compact(%{
-      message: non_empty(error.message, default_message),
-      source: error.source || "Temporalex",
-      stack_trace: error.stack_trace || "",
-      cause: maybe_failure(error.cause, "Temporalex caused failure"),
-      failure_info:
-        {:activity_failure_info,
-         compact(%{
-           identity: error.identity || "",
-           activity_type: if(blank?(error.activity_type), do: nil, else: error.activity_type),
-           activity_id: error.activity_id || "",
-           retry_state: retry_state_to_proto(error.retry_state)
-         })}
-    })
+    failure_proto(
+      error,
+      default_message,
+      {:activity_failure_info,
+       compact(%{
+         identity: error.identity || "",
+         activity_type: if(blank?(error.activity_type), do: nil, else: error.activity_type),
+         activity_id: error.activity_id || "",
+         retry_state: retry_state_to_proto(error.retry_state)
+       })}
+    )
   end
 
   defp failure_to_proto(%Failure.WorkflowExecutionError{} = error, default_message) do
-    compact(%{
-      message: non_empty(error.message, default_message),
-      source: error.source || "Temporalex",
-      stack_trace: error.stack_trace || "",
-      cause: maybe_failure(error.cause, "Temporalex caused failure"),
-      failure_info:
-        {:child_workflow_execution_failure_info,
-         compact(%{
-           namespace: error.namespace || "",
-           workflow_execution:
-             if(blank?(error.workflow_id) and blank?(error.run_id),
-               do: nil,
-               else: %{workflow_id: error.workflow_id || "", run_id: error.run_id || ""}
-             ),
-           workflow_type: if(blank?(error.workflow_type), do: nil, else: error.workflow_type),
-           retry_state: retry_state_to_proto(error.retry_state)
-         })}
-    })
+    failure_proto(
+      error,
+      default_message,
+      {:child_workflow_execution_failure_info,
+       compact(%{
+         namespace: error.namespace || "",
+         workflow_execution:
+           if(blank?(error.workflow_id) and blank?(error.run_id),
+             do: nil,
+             else: %{workflow_id: error.workflow_id || "", run_id: error.run_id || ""}
+           ),
+         workflow_type: if(blank?(error.workflow_type), do: nil, else: error.workflow_type),
+         retry_state: retry_state_to_proto(error.retry_state)
+       })}
+    )
   end
 
   defp failure_to_proto(term, default_message) do
@@ -964,53 +982,42 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
     end
   end
 
-  defp activity_cancellation_type_to_proto(:try_cancel), do: {:ok, :TRY_CANCEL}
+  defp activity_cancellation_type_to_proto(type) do
+    enum_to_proto(
+      @activity_cancellation_types_to_proto,
+      type,
+      "unsupported activity cancellation type"
+    )
+  end
 
-  defp activity_cancellation_type_to_proto(:wait_cancellation_completed),
-    do: {:ok, :WAIT_CANCELLATION_COMPLETED}
+  defp versioning_intent_to_proto(intent) do
+    enum_to_proto(
+      @versioning_intents_to_proto,
+      intent,
+      "unsupported continue-as-new versioning_intent"
+    )
+  end
 
-  defp activity_cancellation_type_to_proto(:abandon), do: {:ok, :ABANDON}
+  defp continue_as_new_versioning_behavior_to_proto(behavior) do
+    enum_to_proto(
+      @continue_as_new_versioning_behaviors_to_proto,
+      behavior,
+      "unsupported continue-as-new initial_versioning_behavior"
+    )
+  end
 
-  defp activity_cancellation_type_to_proto(_type),
-    do: {:error, "unsupported activity cancellation type"}
+  defp retry_state_to_proto(state),
+    do: lookup(@retry_states_to_proto, state, :RETRY_STATE_UNSPECIFIED)
 
-  defp versioning_intent_to_proto(nil), do: {:ok, :UNSPECIFIED}
-  defp versioning_intent_to_proto(:unspecified), do: {:ok, :UNSPECIFIED}
-  defp versioning_intent_to_proto(:compatible), do: {:ok, :COMPATIBLE}
-  defp versioning_intent_to_proto(:default), do: {:ok, :DEFAULT}
+  defp timeout_type_to_proto(type),
+    do: lookup(@timeout_types_to_proto, type, :TIMEOUT_TYPE_UNSPECIFIED)
 
-  defp versioning_intent_to_proto(_intent),
-    do: {:error, "unsupported continue-as-new versioning_intent"}
-
-  defp continue_as_new_versioning_behavior_to_proto(nil),
-    do: {:ok, :CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_UNSPECIFIED}
-
-  defp continue_as_new_versioning_behavior_to_proto(:unspecified),
-    do: {:ok, :CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_UNSPECIFIED}
-
-  defp continue_as_new_versioning_behavior_to_proto(:auto_upgrade),
-    do: {:ok, :CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_AUTO_UPGRADE}
-
-  defp continue_as_new_versioning_behavior_to_proto(:use_ramping_version),
-    do: {:ok, :CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_USE_RAMPING_VERSION}
-
-  defp continue_as_new_versioning_behavior_to_proto(_behavior),
-    do: {:error, "unsupported continue-as-new initial_versioning_behavior"}
-
-  defp retry_state_to_proto(:in_progress), do: :RETRY_STATE_IN_PROGRESS
-  defp retry_state_to_proto(:non_retryable_failure), do: :RETRY_STATE_NON_RETRYABLE_FAILURE
-  defp retry_state_to_proto(:timeout), do: :RETRY_STATE_TIMEOUT
-  defp retry_state_to_proto(:maximum_attempts_reached), do: :RETRY_STATE_MAXIMUM_ATTEMPTS_REACHED
-  defp retry_state_to_proto(:retry_policy_not_set), do: :RETRY_STATE_RETRY_POLICY_NOT_SET
-  defp retry_state_to_proto(:internal_server_error), do: :RETRY_STATE_INTERNAL_SERVER_ERROR
-  defp retry_state_to_proto(:cancel_requested), do: :RETRY_STATE_CANCEL_REQUESTED
-  defp retry_state_to_proto(_), do: :RETRY_STATE_UNSPECIFIED
-
-  defp timeout_type_to_proto(:start_to_close), do: :TIMEOUT_TYPE_START_TO_CLOSE
-  defp timeout_type_to_proto(:schedule_to_start), do: :TIMEOUT_TYPE_SCHEDULE_TO_START
-  defp timeout_type_to_proto(:schedule_to_close), do: :TIMEOUT_TYPE_SCHEDULE_TO_CLOSE
-  defp timeout_type_to_proto(:heartbeat), do: :TIMEOUT_TYPE_HEARTBEAT
-  defp timeout_type_to_proto(_), do: :TIMEOUT_TYPE_UNSPECIFIED
+  defp enum_to_proto(map, key, error) do
+    case Map.fetch(map, key) do
+      {:ok, value} -> {:ok, value}
+      :error -> {:error, error}
+    end
+  end
 
   defp force_cause_from_opts(opts) do
     case Keyword.get(opts, :force_cause) do
