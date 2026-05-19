@@ -376,6 +376,7 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
   defp payloads_to_terms(payloads), do: PayloadConverter.payloads_to_terms(payloads || [])
 
   defp payloads_to_terms_option(nil), do: {:ok, []}
+  defp payloads_to_terms_option(%{} = payloads) when map_size(payloads) == 0, do: {:ok, []}
 
   defp payloads_to_terms_option(%{payloads: payloads}) do
     payloads_to_terms(payloads)
