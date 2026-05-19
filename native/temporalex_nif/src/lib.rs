@@ -1,6 +1,6 @@
-use anyhow::{Context, anyhow};
+use anyhow::anyhow;
 use prost::Message;
-use rustler::types::elixir_struct::{get_ex_struct_name, make_ex_struct};
+use rustler::types::elixir_struct::make_ex_struct;
 use rustler::types::list::ListIterator;
 use rustler::{Atom, Binary, Env, LocalPid, MapIterator, Monitor, NewBinary, OwnedEnv};
 use rustler::{Decoder, Encoder, Resource, ResourceArc, Term};
@@ -19,47 +19,21 @@ use temporalio_client::{
     },
 };
 use temporalio_common::data_converters::RawValue;
-use temporalio_common::protos::coresdk::activity_result::{
-    ActivityExecutionResult, ActivityResolution, Cancellation, Failure as ActivityFailure,
-    Success as ActivitySuccess, activity_execution_result, activity_resolution,
-};
-use temporalio_common::protos::coresdk::activity_task::{ActivityTask, activity_task};
-use temporalio_common::protos::coresdk::common::VersioningIntent;
-use temporalio_common::protos::coresdk::workflow_activation::{
-    WorkflowActivation, WorkflowActivationJob, remove_from_cache::EvictionReason,
-    workflow_activation_job,
-};
-use temporalio_common::protos::coresdk::workflow_commands::{
-    ActivityCancellationType, CancelTimer, CancelWorkflowExecution, CompleteWorkflowExecution,
-    ContinueAsNewWorkflowExecution, FailWorkflowExecution, QueryResult, QuerySuccess,
-    RequestCancelActivity, ScheduleActivity, SetPatchMarker, StartTimer, UpdateResponse,
-    UpsertWorkflowSearchAttributes, WorkflowCommand, query_result, update_response,
-    workflow_command,
-};
-use temporalio_common::protos::coresdk::workflow_completion::{
-    Failure as WorkflowCompletionFailure, Success as WorkflowCompletionSuccess,
-    WorkflowActivationCompletion, workflow_activation_completion,
-};
+use temporalio_common::protos::coresdk::workflow_completion::WorkflowActivationCompletion;
 use temporalio_common::protos::coresdk::{ActivityHeartbeat, ActivityTaskCompletion};
 use temporalio_common::protos::temporal::api::common::v1::{
-    ActivityType, Header, Payload, Payloads, RetryPolicy, SearchAttributes, WorkflowExecution,
-    WorkflowType,
+    Header, Payload, Payloads, RetryPolicy,
 };
 use temporalio_common::protos::temporal::api::enums::v1::{
-    ContinueAsNewVersioningBehavior, QueryRejectCondition, RetryState, TimeoutType,
-    VersioningBehavior, WorkflowExecutionStatus, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
-    WorkflowTaskFailedCause,
+    QueryRejectCondition, RetryState, TimeoutType, WorkflowExecutionStatus,
+    WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
 };
-use temporalio_common::protos::temporal::api::failure::v1::{
-    ActivityFailureInfo, ApplicationFailureInfo, CanceledFailureInfo,
-    ChildWorkflowExecutionFailureInfo, Failure, TimeoutFailureInfo, failure,
-};
+use temporalio_common::protos::temporal::api::failure::v1::{Failure, failure};
 use temporalio_common::worker::WorkerTaskTypes;
 use temporalio_sdk_core::{
     CoreRuntime, PollError, PollerBehavior, RuntimeOptions, TokioRuntimeBuilder, Worker,
     WorkerConfig, WorkerVersioningStrategy, init_worker,
 };
-use time::OffsetDateTime;
 use url::Url;
 
 rustler::atoms! {
@@ -275,7 +249,6 @@ rustler::atoms! {
 
 const ETF_ENCODING: &[u8] = b"binary/erlang-eterm";
 const JSON_ENCODING: &[u8] = b"json/plain";
-const DEFAULT_ACTIVITY_TIMEOUT_MS: u64 = 30_000;
 
 pub struct RuntimeResource {
     core: CoreRuntime,
@@ -414,18 +387,10 @@ fn send_error(pid: &LocalPid, reason: impl Into<String>) {
     send_simple(pid, |env| (backend_error(), reason).encode(env));
 }
 
-fn ok_binary<'a>(env: Env<'a>, bytes: Vec<u8>) -> Term<'a> {
-    (ok(), binary_term(env, &bytes)).encode(env)
-}
-
 fn binary_term<'a>(env: Env<'a>, bytes: &[u8]) -> Term<'a> {
     let mut binary = NewBinary::new(env, bytes.len());
     binary.copy_from_slice(bytes);
     Term::from(binary)
-}
-
-fn error_term<'a>(env: Env<'a>, reason: impl Into<String>) -> Term<'a> {
-    (error(), reason.into()).encode(env)
 }
 
 fn string_term<'a>(env: Env<'a>, value: impl Into<String>) -> Term<'a> {
@@ -553,6 +518,7 @@ fn start_worker(
     max_wf: usize,
     max_act: usize,
     pid: LocalPid,
+    poll_pid: LocalPid,
 ) -> Atom {
     let handle = runtime.core.tokio_handle();
     let runtime_for_worker = runtime.clone();
@@ -590,7 +556,7 @@ fn start_worker(
                 });
 
                 let _ = resource.monitor(None, &pid);
-                start_poll_loops(resource.clone(), pid);
+                start_poll_loops(resource.clone(), poll_pid);
                 send_simple(&pid, |env| (worker_started(), resource).encode(env));
             }
             Err(err) => {
@@ -602,26 +568,6 @@ fn start_worker(
     });
 
     ok()
-}
-
-#[rustler::nif]
-fn encode_workflow_completion<'a>(
-    env: Env<'a>,
-    completion: Term<'a>,
-    task_queue: String,
-) -> Term<'a> {
-    match workflow_completion_from_term(completion, &task_queue) {
-        Ok(completion) => ok_binary(env, completion.encode_to_vec()),
-        Err(err) => error_term(env, format!("{err:#}")),
-    }
-}
-
-#[rustler::nif]
-fn encode_activity_completion<'a>(env: Env<'a>, completion: Term<'a>) -> Term<'a> {
-    match activity_completion_from_term(completion) {
-        Ok(completion) => ok_binary(env, completion.encode_to_vec()),
-        Err(err) => error_term(env, format!("{err:#}")),
-    }
 }
 
 #[rustler::nif]
@@ -685,21 +631,18 @@ fn complete_activity_task(
 }
 
 #[rustler::nif]
-fn record_activity_heartbeat(
+fn record_activity_heartbeat<'a>(
+    env: Env<'a>,
     worker: ResourceArc<WorkerResource>,
-    task_token: Binary,
-    details_bytes: Option<Binary>,
-) -> Atom {
-    let details = details_bytes
-        .map(|bytes| vec![payload_from_bytes(bytes.as_slice().to_vec())])
-        .unwrap_or_default();
-
-    worker.worker.record_activity_heartbeat(ActivityHeartbeat {
-        task_token: task_token.as_slice().to_vec(),
-        details,
-    });
-
-    ok()
+    bytes: Binary,
+) -> Term<'a> {
+    match ActivityHeartbeat::decode(bytes.as_slice()) {
+        Ok(heartbeat) => {
+            worker.worker.record_activity_heartbeat(heartbeat);
+            ok().encode(env)
+        }
+        Err(err) => (error(), format!("{err:#}")).encode(env),
+    }
 }
 
 #[rustler::nif]
@@ -1236,24 +1179,10 @@ fn start_poll_loops(worker: ResourceArc<WorkerResource>, pid: LocalPid) {
         loop {
             match workflow_worker.worker.poll_workflow_activation().await {
                 Ok(activation) => {
-                    let sent = {
-                        let mut ok = true;
-                        send_simple(&workflow_pid, |env| {
-                            match activation_to_term(env, &activation) {
-                                Ok(term) => (workflow_activation(), term).encode(env),
-                                Err(err) => {
-                                    ok = false;
-                                    (backend_error(), format!("{err:#}")).encode(env)
-                                }
-                            }
-                        });
-                        ok
-                    };
-
-                    if !sent {
-                        guard.exit(crashed());
-                        break;
-                    }
+                    let bytes = activation.encode_to_vec();
+                    send_simple(&workflow_pid, |env| {
+                        (workflow_activation(), binary_term(env, &bytes)).encode(env)
+                    });
                 }
                 Err(PollError::ShutDown) => {
                     guard.exit(shutdown());
@@ -1275,24 +1204,10 @@ fn start_poll_loops(worker: ResourceArc<WorkerResource>, pid: LocalPid) {
         loop {
             match activity_worker.worker.poll_activity_task().await {
                 Ok(task) => {
-                    let sent = {
-                        let mut ok = true;
-                        send_simple(&activity_pid, |env| {
-                            match activity_task_to_term(env, &task) {
-                                Ok(term) => (activity_task(), term).encode(env),
-                                Err(err) => {
-                                    ok = false;
-                                    (backend_error(), format!("{err:#}")).encode(env)
-                                }
-                            }
-                        });
-                        ok
-                    };
-
-                    if !sent {
-                        guard.exit(crashed());
-                        break;
-                    }
+                    let bytes = task.encode_to_vec();
+                    send_simple(&activity_pid, |env| {
+                        (activity_task(), binary_term(env, &bytes)).encode(env)
+                    });
                 }
                 Err(PollError::ShutDown) => {
                     guard.exit(shutdown());
@@ -1592,735 +1507,6 @@ fn payloads_to_terms<'a>(env: Env<'a>, payloads: &[Payload]) -> anyhow::Result<V
         .collect()
 }
 
-fn payload_map_to_term<'a>(
-    env: Env<'a>,
-    payloads: &HashMap<String, Payload>,
-) -> anyhow::Result<Term<'a>> {
-    let mut map = Term::map_new(env);
-    for (key, payload) in payloads {
-        map = map_put(map, key, payload_to_term(env, payload)?)?;
-    }
-    Ok(map)
-}
-
-fn activation_to_term<'a>(
-    env: Env<'a>,
-    activation: &WorkflowActivation,
-) -> anyhow::Result<Term<'a>> {
-    let job_terms = activation
-        .jobs
-        .iter()
-        .map(|job| activation_job_to_term(env, job))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    put_fields!(
-        make_struct(env, "Elixir.Temporalex.Core.Activation")?,
-        run_id() => activation.run_id.clone(),
-        timestamp() => timestamp_to_datetime(env, activation.timestamp.as_ref())?,
-        is_replaying() => activation.is_replaying,
-        history_length() => activation.history_length as i64,
-        history_size_bytes() => activation.history_size_bytes as i64,
-        continue_as_new_suggested() => activation.continue_as_new_suggested,
-        available_internal_flags() => activation
-            .available_internal_flags
-            .iter()
-            .map(|flag| *flag as i64)
-            .collect::<Vec<_>>(),
-        deployment_version() => nil(),
-        jobs() => job_terms,
-    )
-}
-
-fn activation_job_to_term<'a>(
-    env: Env<'a>,
-    job: &WorkflowActivationJob,
-) -> anyhow::Result<Term<'a>> {
-    match job
-        .variant
-        .as_ref()
-        .context("activation job had no variant")?
-    {
-        workflow_activation_job::Variant::InitializeWorkflow(init) => {
-            let workflow_info_term = put_fields!(
-                Term::map_new(env),
-                workflow_id() => init.workflow_id.clone(),
-                workflow_type() => init.workflow_type.clone(),
-                attempt() => init.attempt as i64,
-                identity() => init.identity.clone(),
-                run_id() => init.first_execution_run_id.clone(),
-            )?;
-
-            put_fields!(
-                make_struct(env, "Elixir.Temporalex.Core.Job.InitializeWorkflow")?,
-                workflow_type() => init.workflow_type.clone(),
-                workflow_id() => init.workflow_id.clone(),
-                arguments() => payloads_to_terms(env, &init.arguments)?,
-                headers() => payload_map_to_term(env, &init.headers)?,
-                workflow_info() => workflow_info_term,
-                randomness_seed() => init.randomness_seed as i64,
-            )
-        }
-        workflow_activation_job::Variant::FireTimer(timer) => {
-            put_fields!(
-                make_struct(env, "Elixir.Temporalex.Core.Job.TimerFired")?,
-                seq() => timer.seq as i64,
-            )
-        }
-        workflow_activation_job::Variant::ResolveActivity(resolution) => {
-            put_fields!(
-                make_struct(env, "Elixir.Temporalex.Core.Job.ActivityResolved")?,
-                seq() => resolution.seq as i64,
-                result() => activity_resolution_to_term(env, resolution.result.as_ref())?,
-            )
-        }
-        workflow_activation_job::Variant::UpdateRandomSeed(seed) => {
-            put_fields!(
-                make_struct(env, "Elixir.Temporalex.Core.Job.UpdateRandomSeed")?,
-                randomness_seed() => seed.randomness_seed as i64,
-            )
-        }
-        workflow_activation_job::Variant::QueryWorkflow(query) => {
-            put_fields!(
-                make_struct(env, "Elixir.Temporalex.Core.Job.QueryReceived")?,
-                query_id() => query.query_id.clone(),
-                query_type() => query.query_type.clone(),
-                args() => payloads_to_terms(env, &query.arguments)?,
-                headers() => payload_map_to_term(env, &query.headers)?,
-            )
-        }
-        workflow_activation_job::Variant::CancelWorkflow(cancel_job) => {
-            put_fields!(
-                make_struct(env, "Elixir.Temporalex.Core.Job.CancelWorkflow")?,
-                reason() => cancel_job.reason.clone(),
-            )
-        }
-        workflow_activation_job::Variant::SignalWorkflow(signal_job) => {
-            put_fields!(
-                make_struct(env, "Elixir.Temporalex.Core.Job.SignalReceived")?,
-                name() => signal_job.signal_name.clone(),
-                args() => payloads_to_terms(env, &signal_job.input)?,
-                headers() => payload_map_to_term(env, &signal_job.headers)?,
-                identity() => signal_job.identity.clone(),
-            )
-        }
-        workflow_activation_job::Variant::NotifyHasPatch(patch) => {
-            put_fields!(
-                make_struct(env, "Elixir.Temporalex.Core.Job.NotifyPatch")?,
-                id() => patch.patch_id.clone(),
-            )
-        }
-        workflow_activation_job::Variant::DoUpdate(update) => {
-            put_fields!(
-                make_struct(env, "Elixir.Temporalex.Core.Job.UpdateReceived")?,
-                id() => update.id.clone(),
-                protocol_instance_id() => update.protocol_instance_id.clone(),
-                name() => update.name.clone(),
-                args() => payloads_to_terms(env, &update.input)?,
-                headers() => payload_map_to_term(env, &update.headers)?,
-                meta() => nil(),
-                run_validator() => update.run_validator,
-            )
-        }
-        workflow_activation_job::Variant::RemoveFromCache(eviction) => {
-            put_fields!(
-                make_struct(env, "Elixir.Temporalex.Core.Job.RemoveFromCache")?,
-                reason() => eviction_reason_atom(eviction.reason()),
-                message() => eviction.message.clone(),
-            )
-        }
-        other => Err(anyhow!(
-            "unsupported workflow activation job from Temporal Core: {other:?}"
-        )),
-    }
-}
-
-fn activity_resolution_to_term<'a>(
-    env: Env<'a>,
-    resolution: Option<&ActivityResolution>,
-) -> anyhow::Result<Term<'a>> {
-    let resolution = resolution.context("activity resolution missing result")?;
-    match resolution
-        .status
-        .as_ref()
-        .context("activity resolution empty")?
-    {
-        activity_resolution::Status::Completed(success) => {
-            let payload = success
-                .result
-                .as_ref()
-                .context("activity result missing payload")?;
-            Ok((ok(), payload_to_term(env, payload)?).encode(env))
-        }
-        activity_resolution::Status::Failed(failure) => {
-            Ok((error(), failure_to_term(env, failure.failure.as_ref())?).encode(env))
-        }
-        activity_resolution::Status::Cancelled(cancellation) => Ok((
-            cancelled(),
-            failure_to_term(env, cancellation.failure.as_ref())?,
-        )
-            .encode(env)),
-        activity_resolution::Status::Backoff(backoff_job) => {
-            let details = put_fields!(
-                Term::map_new(env),
-                attempt() => backoff_job.attempt as i64,
-                timeout() => duration_to_millis(backoff_job.backoff_duration.as_ref()) as i64,
-            )?;
-            Ok((backoff(), details).encode(env))
-        }
-    }
-}
-
-fn activity_task_to_term<'a>(env: Env<'a>, task: &ActivityTask) -> anyhow::Result<Term<'a>> {
-    match task
-        .variant
-        .as_ref()
-        .context("activity task had no variant")?
-    {
-        activity_task::Variant::Start(start_task) => {
-            let execution = start_task.workflow_execution.as_ref();
-            put_fields!(
-                make_struct(env, "Elixir.Temporalex.Core.ActivityTask")?,
-                task_token() => binary_term(env, &task.task_token),
-                activity_id() => start_task.activity_id.clone(),
-                activity_type() => start_task.activity_type.clone(),
-                workflow_id() => execution
-                    .map(|execution| execution.workflow_id.clone())
-                    .unwrap_or_default(),
-                run_id() => execution
-                    .map(|execution| execution.run_id.clone())
-                    .unwrap_or_default(),
-                workflow_type() => start_task.workflow_type.clone(),
-                namespace() => start_task.workflow_namespace.clone(),
-                task_queue() => nil(),
-                input() => payloads_to_terms(env, &start_task.input)?,
-                attempt() => start_task.attempt as i64,
-                heartbeat_timeout() => nullable_duration_millis(env, start_task.heartbeat_timeout.as_ref()),
-                is_local() => start_task.is_local,
-                headers() => payload_map_to_term(env, &start_task.header_fields)?,
-                variant() => start(),
-                cancel_reason() => nil(),
-            )
-        }
-        activity_task::Variant::Cancel(cancel_task) => {
-            put_fields!(
-                make_struct(env, "Elixir.Temporalex.Core.ActivityTask")?,
-                task_token() => binary_term(env, &task.task_token),
-                variant() => cancel(),
-                cancel_reason() => activity_cancel_reason(cancel_task.reason()),
-            )
-        }
-    }
-}
-
-fn workflow_completion_from_term(
-    completion: Term,
-    default_task_queue: &str,
-) -> anyhow::Result<WorkflowActivationCompletion> {
-    let run_id: String = decode_term(map_get(completion, crate::run_id())?)?;
-    let status = map_get(completion, crate::status_atom())?;
-
-    if let Ok((tag, commands_term)) = status.decode::<(Atom, Term)>() {
-        if tag == ok() {
-            let commands = commands_from_term(commands_term, default_task_queue)?;
-            return Ok(WorkflowActivationCompletion {
-                run_id,
-                status: Some(workflow_activation_completion::Status::Successful(
-                    WorkflowCompletionSuccess {
-                        commands,
-                        used_internal_flags: vec![],
-                        versioning_behavior: VersioningBehavior::Unspecified as i32,
-                    },
-                )),
-            });
-        }
-    }
-
-    if let Ok((tag, reason_term, opts_term)) = status.decode::<(Atom, Term, Term)>() {
-        if tag == failed() {
-            let force_cause = force_cause_from_opts(opts_term);
-            return Ok(WorkflowActivationCompletion {
-                run_id,
-                status: Some(workflow_activation_completion::Status::Failed(
-                    WorkflowCompletionFailure {
-                        failure: Some(failure_from_term(
-                            reason_term,
-                            "Temporalex activation failure",
-                        )?),
-                        force_cause: force_cause as i32,
-                    },
-                )),
-            });
-        }
-    }
-
-    Err(anyhow!("unsupported workflow completion status"))
-}
-
-fn commands_from_term(
-    commands_term: Term,
-    default_task_queue: &str,
-) -> anyhow::Result<Vec<WorkflowCommand>> {
-    let iter: ListIterator = decode_term(commands_term)?;
-    iter.map(|command| command_from_term(command, default_task_queue))
-        .collect()
-}
-
-fn command_from_term(command: Term, default_task_queue: &str) -> anyhow::Result<WorkflowCommand> {
-    let module_atom = get_ex_struct_name(command).map_err(nif_error)?;
-    let module = module_atom
-        .to_term(command.get_env())
-        .atom_to_string()
-        .map_err(nif_error)?;
-    let variant = match module.as_str() {
-        "Elixir.Temporalex.Core.Command.StartTimer" => {
-            let duration_ms = map_get_non_negative_i64(command, duration_ms(), "timer duration")?;
-
-            workflow_command::Variant::StartTimer(StartTimer {
-                seq: map_get_i64(command, seq())? as u32,
-                start_to_fire_timeout: Some(duration_from_ms(duration_ms)),
-            })
-        }
-        "Elixir.Temporalex.Core.Command.CancelTimer" => {
-            workflow_command::Variant::CancelTimer(CancelTimer {
-                seq: map_get_i64(command, seq())? as u32,
-            })
-        }
-        "Elixir.Temporalex.Core.Command.RequestCancelActivity" => {
-            workflow_command::Variant::RequestCancelActivity(RequestCancelActivity {
-                seq: map_get_i64(command, seq())? as u32,
-            })
-        }
-        "Elixir.Temporalex.Core.Command.ScheduleActivity" => {
-            let opts = map_get(command, opts_atom())?;
-            let task_queue = keyword_get_string(opts, task_queue())?
-                .unwrap_or_else(|| default_task_queue.to_string());
-            let timeout_ms = keyword_get_millis(opts, timeout(), "activity timeout")?
-                .or(keyword_get_millis(
-                    opts,
-                    start_to_close_timeout(),
-                    "activity start_to_close_timeout",
-                )?)
-                .unwrap_or(DEFAULT_ACTIVITY_TIMEOUT_MS);
-
-            workflow_command::Variant::ScheduleActivity(ScheduleActivity {
-                seq: map_get_i64(command, seq())? as u32,
-                activity_id: map_get_string(command, activity_id())?,
-                activity_type: map_get_string(command, type_atom())?,
-                task_queue,
-                headers: keyword_get_payload_map(opts, headers())?,
-                arguments: terms_list_to_payloads(map_get(command, input())?)?,
-                schedule_to_close_timeout: Some(duration_from_ms(
-                    keyword_get_millis(
-                        opts,
-                        schedule_to_close_timeout(),
-                        "activity schedule_to_close_timeout",
-                    )?
-                    .unwrap_or(timeout_ms),
-                )),
-                schedule_to_start_timeout: keyword_get_millis(
-                    opts,
-                    schedule_to_start_timeout(),
-                    "activity schedule_to_start_timeout",
-                )?
-                .map(duration_from_ms),
-                start_to_close_timeout: Some(duration_from_ms(timeout_ms)),
-                heartbeat_timeout: keyword_get_millis(
-                    opts,
-                    heartbeat_timeout(),
-                    "activity heartbeat_timeout",
-                )?
-                .map(duration_from_ms),
-                retry_policy: retry_policy_from_opts(opts)?,
-                cancellation_type: activity_cancellation_type_from_opts(opts)? as i32,
-                do_not_eagerly_execute: false,
-                ..Default::default()
-            })
-        }
-        "Elixir.Temporalex.Core.Command.CompleteWorkflow" => {
-            workflow_command::Variant::CompleteWorkflowExecution(CompleteWorkflowExecution {
-                result: Some(payload_from_term(map_get(command, result())?)),
-            })
-        }
-        "Elixir.Temporalex.Core.Command.FailWorkflow" => {
-            workflow_command::Variant::FailWorkflowExecution(FailWorkflowExecution {
-                failure: Some(failure_from_term(
-                    map_get(command, reason())?,
-                    "Temporalex workflow failure",
-                )?),
-            })
-        }
-        "Elixir.Temporalex.Core.Command.ContinueAsNew" => {
-            let opts = map_get(command, opts_atom())?;
-            let workflow_type =
-                map_get_optional_string(command, workflow_type())?.unwrap_or_default();
-            let task_queue = map_get_optional_string(command, task_queue())?.unwrap_or_default();
-
-            workflow_command::Variant::ContinueAsNewWorkflowExecution(
-                ContinueAsNewWorkflowExecution {
-                    workflow_type,
-                    task_queue,
-                    arguments: vec![payload_from_term(map_get(command, input())?)],
-                    workflow_run_timeout: proto_duration_option_from_opts(
-                        opts,
-                        &[run_timeout(), workflow_run_timeout()],
-                    )?,
-                    workflow_task_timeout: proto_duration_option_from_opts(
-                        opts,
-                        &[task_timeout(), workflow_task_timeout()],
-                    )?,
-                    memo: keyword_get_payload_map(opts, memo())?,
-                    headers: keyword_get_payload_map(opts, headers())?,
-                    search_attributes: search_attributes_option_from_opts(opts)?
-                        .map(|indexed_fields| SearchAttributes { indexed_fields }),
-                    retry_policy: retry_policy_from_opts(opts)?,
-                    versioning_intent: versioning_intent_from_opts(opts)? as i32,
-                    initial_versioning_behavior: continue_as_new_versioning_behavior_from_opts(
-                        opts,
-                    )? as i32,
-                    ..Default::default()
-                },
-            )
-        }
-        "Elixir.Temporalex.Core.Command.CancelWorkflow" => {
-            workflow_command::Variant::CancelWorkflowExecution(CancelWorkflowExecution {})
-        }
-        "Elixir.Temporalex.Core.Command.RespondToQuery" => {
-            workflow_command::Variant::RespondToQuery(query_result_from_term(command)?)
-        }
-        "Elixir.Temporalex.Core.Command.RespondToUpdate" => {
-            workflow_command::Variant::UpdateResponse(update_response_from_term(command)?)
-        }
-        "Elixir.Temporalex.Core.Command.SetPatchMarker" => {
-            workflow_command::Variant::SetPatchMarker(SetPatchMarker {
-                patch_id: map_get_string(command, id())?,
-                deprecated: command
-                    .map_get(deprecated())
-                    .ok()
-                    .and_then(|t| t.decode().ok())
-                    .unwrap_or(false),
-            })
-        }
-        "Elixir.Temporalex.Core.Command.UpsertSearchAttributes" => {
-            workflow_command::Variant::UpsertWorkflowSearchAttributes(
-                UpsertWorkflowSearchAttributes {
-                    search_attributes: Some(SearchAttributes {
-                        indexed_fields: term_to_search_attributes_map(map_get(command, attrs())?)?,
-                    }),
-                },
-            )
-        }
-        unsupported => return Err(anyhow!("unsupported workflow command {unsupported}")),
-    };
-
-    Ok(WorkflowCommand {
-        variant: Some(variant),
-        user_metadata: None,
-    })
-}
-
-fn activity_completion_from_term(completion: Term) -> anyhow::Result<ActivityTaskCompletion> {
-    let task_token_binary: Binary = decode_term(map_get(completion, task_token())?)?;
-    let result_term = map_get(completion, result())?;
-    let result = if let Ok((tag, value)) = result_term.decode::<(Atom, Term)>() {
-        if tag == ok() {
-            ActivityExecutionResult {
-                status: Some(activity_execution_result::Status::Completed(
-                    ActivitySuccess {
-                        result: Some(payload_from_term(value)),
-                    },
-                )),
-            }
-        } else if tag == error() {
-            ActivityExecutionResult {
-                status: Some(activity_execution_result::Status::Failed(ActivityFailure {
-                    failure: Some(failure_from_term(value, "Temporalex activity failure")?),
-                })),
-            }
-        } else if tag == cancelled() {
-            ActivityExecutionResult {
-                status: Some(activity_execution_result::Status::Cancelled(Cancellation {
-                    failure: Some(cancelled_failure_from_term(value)?),
-                })),
-            }
-        } else {
-            return Err(anyhow!("unsupported activity completion result tag"));
-        }
-    } else {
-        return Err(anyhow!("activity completion result must be a tagged tuple"));
-    };
-
-    Ok(ActivityTaskCompletion {
-        task_token: task_token_binary.as_slice().to_vec(),
-        result: Some(result),
-    })
-}
-
-fn query_result_from_term(command: Term) -> anyhow::Result<QueryResult> {
-    let query_id = map_get_string(command, query_id())?;
-    let result_term = map_get(command, result())?;
-
-    if let Ok((tag, value)) = result_term.decode::<(Atom, Term)>() {
-        if tag == ok() {
-            return Ok(QueryResult {
-                query_id,
-                variant: Some(query_result::Variant::Succeeded(QuerySuccess {
-                    response: Some(payload_from_term(value)),
-                })),
-            });
-        }
-
-        if tag == error() {
-            return Ok(QueryResult {
-                query_id,
-                variant: Some(query_result::Variant::Failed(failure_from_term(
-                    value,
-                    "Temporalex query failure",
-                )?)),
-            });
-        }
-    }
-
-    Err(anyhow!(
-        "query result must be {{:ok, value}} or {{:error, reason}}"
-    ))
-}
-
-fn update_response_from_term(command: Term) -> anyhow::Result<UpdateResponse> {
-    let protocol_instance_id = map_get_string(command, protocol_instance_id())?;
-    let response_term = map_get(command, response())?;
-
-    let response = if response_term.decode::<Atom>().ok() == Some(accepted()) {
-        update_response::Response::Accepted(Default::default())
-    } else if let Ok((tag, value)) = response_term.decode::<(Atom, Term)>() {
-        if tag == completed() {
-            update_response::Response::Completed(payload_from_term(value))
-        } else if tag == rejected() {
-            update_response::Response::Rejected(failure_from_term(
-                value,
-                "Temporalex update rejected",
-            )?)
-        } else {
-            return Err(anyhow!("unsupported update response tag"));
-        }
-    } else {
-        return Err(anyhow!("unsupported update response"));
-    };
-
-    Ok(UpdateResponse {
-        protocol_instance_id,
-        response: Some(response),
-    })
-}
-
-fn failure_from_term(term: Term, default_message: &str) -> anyhow::Result<Failure> {
-    if let Ok((tag, error_term, _stacktrace)) = term.decode::<(Atom, Term, Term)>()
-        && tag == exception()
-    {
-        return failure_from_term(error_term, default_message);
-    }
-
-    match struct_module_name(term).as_deref() {
-        Some("Elixir.Temporalex.Failure.ApplicationError") => {
-            application_failure_from_struct(term, default_message)
-        }
-        Some("Elixir.Temporalex.Failure.CancelledError") => cancelled_failure_from_term(term),
-        Some("Elixir.Temporalex.Failure.TimeoutError") => {
-            timeout_failure_from_struct(term, default_message)
-        }
-        Some("Elixir.Temporalex.Failure.ActivityError") => {
-            activity_failure_from_struct(term, default_message)
-        }
-        Some("Elixir.Temporalex.Failure.WorkflowExecutionError") => {
-            child_workflow_failure_from_struct(term, default_message)
-        }
-        _ => Ok(untyped_application_failure_from_term(term, default_message)),
-    }
-}
-
-fn application_failure_from_struct(term: Term, default_message: &str) -> anyhow::Result<Failure> {
-    let message = map_get_optional_string(term, message())?
-        .filter(|message| !message.is_empty())
-        .unwrap_or_else(|| default_message.to_string());
-    let failure_type = map_get_optional_string(term, type_atom())?
-        .filter(|failure_type| !failure_type.is_empty())
-        .unwrap_or_else(|| "Temporalex.ApplicationError".to_string());
-    let retryable = map_get_optional_bool(term, retryable_question())?.unwrap_or(true);
-    let details = map_get_payloads_list(term, details())?;
-
-    Ok(Failure {
-        message,
-        source: map_get_optional_string(term, source())?
-            .unwrap_or_else(|| "Temporalex".to_string()),
-        stack_trace: map_get_optional_string(term, stack_trace())?.unwrap_or_default(),
-        failure_info: Some(failure::FailureInfo::ApplicationFailureInfo(
-            ApplicationFailureInfo {
-                r#type: failure_type,
-                non_retryable: !retryable,
-                details: Some(Payloads { payloads: details }),
-                ..Default::default()
-            },
-        )),
-        cause: failure_cause_from_map(term)?,
-        ..Default::default()
-    })
-}
-
-fn untyped_application_failure_from_term(term: Term, default_message: &str) -> Failure {
-    let message = term
-        .decode::<String>()
-        .ok()
-        .filter(|message| !message.is_empty())
-        .unwrap_or_else(|| default_message.to_string());
-
-    Failure {
-        message,
-        source: "Temporalex".to_string(),
-        failure_info: Some(failure::FailureInfo::ApplicationFailureInfo(
-            ApplicationFailureInfo {
-                r#type: "Temporalex.ApplicationError".to_string(),
-                non_retryable: false,
-                details: Some(Payloads {
-                    payloads: vec![payload_from_term(term)],
-                }),
-                ..Default::default()
-            },
-        )),
-        ..Default::default()
-    }
-}
-
-fn cancelled_failure_from_term(term: Term) -> anyhow::Result<Failure> {
-    if let Some("Elixir.Temporalex.Failure.CancelledError") = struct_module_name(term).as_deref() {
-        return Ok(Failure {
-            message: map_get_optional_string(term, message())?
-                .unwrap_or_else(|| "Temporalex activity cancelled".to_string()),
-            source: map_get_optional_string(term, source())?
-                .unwrap_or_else(|| "Temporalex".to_string()),
-            stack_trace: map_get_optional_string(term, stack_trace())?.unwrap_or_default(),
-            failure_info: Some(failure::FailureInfo::CanceledFailureInfo(
-                CanceledFailureInfo {
-                    details: Some(Payloads {
-                        payloads: map_get_payloads_list(term, details())?,
-                    }),
-                    identity: map_get_optional_string(term, identity())?.unwrap_or_default(),
-                },
-            )),
-            cause: failure_cause_from_map(term)?,
-            ..Default::default()
-        });
-    }
-
-    Ok(Failure {
-        message: "Temporalex activity cancelled".to_string(),
-        source: "Temporalex".to_string(),
-        failure_info: Some(failure::FailureInfo::CanceledFailureInfo(
-            CanceledFailureInfo {
-                details: Some(Payloads {
-                    payloads: vec![payload_from_term(term)],
-                }),
-                ..Default::default()
-            },
-        )),
-        ..Default::default()
-    })
-}
-
-fn timeout_failure_from_struct(term: Term, default_message: &str) -> anyhow::Result<Failure> {
-    Ok(Failure {
-        message: map_get_optional_string(term, message())?
-            .filter(|message| !message.is_empty())
-            .unwrap_or_else(|| default_message.to_string()),
-        source: map_get_optional_string(term, source())?
-            .unwrap_or_else(|| "Temporalex".to_string()),
-        stack_trace: map_get_optional_string(term, stack_trace())?.unwrap_or_default(),
-        failure_info: Some(failure::FailureInfo::TimeoutFailureInfo(
-            TimeoutFailureInfo {
-                timeout_type: timeout_type_from_atom(map_get_optional_atom(term, timeout_type())?)
-                    as i32,
-                last_heartbeat_details: Some(Payloads {
-                    payloads: map_get_payloads_list(term, last_heartbeat_details())?,
-                }),
-            },
-        )),
-        cause: failure_cause_from_map(term)?,
-        ..Default::default()
-    })
-}
-
-fn activity_failure_from_struct(term: Term, default_message: &str) -> anyhow::Result<Failure> {
-    let activity_type_name = map_get_optional_string(term, activity_type())?.unwrap_or_default();
-
-    Ok(Failure {
-        message: map_get_optional_string(term, message())?
-            .filter(|message| !message.is_empty())
-            .unwrap_or_else(|| default_message.to_string()),
-        source: map_get_optional_string(term, source())?
-            .unwrap_or_else(|| "Temporalex".to_string()),
-        stack_trace: map_get_optional_string(term, stack_trace())?.unwrap_or_default(),
-        failure_info: Some(failure::FailureInfo::ActivityFailureInfo(
-            ActivityFailureInfo {
-                identity: map_get_optional_string(term, identity())?.unwrap_or_default(),
-                activity_type: if activity_type_name.is_empty() {
-                    None
-                } else {
-                    Some(ActivityType {
-                        name: activity_type_name,
-                    })
-                },
-                activity_id: map_get_optional_string(term, activity_id())?.unwrap_or_default(),
-                retry_state: retry_state_from_atom(map_get_optional_atom(term, retry_state())?)
-                    as i32,
-                ..Default::default()
-            },
-        )),
-        cause: failure_cause_from_map(term)?,
-        ..Default::default()
-    })
-}
-
-fn child_workflow_failure_from_struct(
-    term: Term,
-    default_message: &str,
-) -> anyhow::Result<Failure> {
-    let workflow_id = map_get_optional_string(term, workflow_id())?.unwrap_or_default();
-    let run_id = map_get_optional_string(term, run_id())?.unwrap_or_default();
-    let workflow_type_name = map_get_optional_string(term, workflow_type())?.unwrap_or_default();
-
-    Ok(Failure {
-        message: map_get_optional_string(term, message())?
-            .filter(|message| !message.is_empty())
-            .unwrap_or_else(|| default_message.to_string()),
-        source: map_get_optional_string(term, source())?
-            .unwrap_or_else(|| "Temporalex".to_string()),
-        stack_trace: map_get_optional_string(term, stack_trace())?.unwrap_or_default(),
-        failure_info: Some(failure::FailureInfo::ChildWorkflowExecutionFailureInfo(
-            ChildWorkflowExecutionFailureInfo {
-                namespace: map_get_optional_string(term, namespace())?.unwrap_or_default(),
-                workflow_execution: if workflow_id.is_empty() && run_id.is_empty() {
-                    None
-                } else {
-                    Some(WorkflowExecution {
-                        workflow_id,
-                        run_id,
-                    })
-                },
-                workflow_type: if workflow_type_name.is_empty() {
-                    None
-                } else {
-                    Some(WorkflowType {
-                        name: workflow_type_name,
-                    })
-                },
-                retry_state: retry_state_from_atom(map_get_optional_atom(term, retry_state())?)
-                    as i32,
-                ..Default::default()
-            },
-        )),
-        cause: failure_cause_from_map(term)?,
-        ..Default::default()
-    })
-}
-
 fn failure_to_term<'a>(env: Env<'a>, failure: Option<&Failure>) -> anyhow::Result<Term<'a>> {
     let Some(failure) = failure else {
         return Ok(nil().encode(env));
@@ -2394,56 +1580,6 @@ fn failure_to_term<'a>(env: Env<'a>, failure: Option<&Failure>) -> anyhow::Resul
     }
 }
 
-fn struct_module_name(term: Term) -> Option<String> {
-    get_ex_struct_name(term)
-        .ok()?
-        .to_term(term.get_env())
-        .atom_to_string()
-        .ok()
-}
-
-fn map_get_optional_string(map: Term, key: Atom) -> anyhow::Result<Option<String>> {
-    match map_get(map, key) {
-        Ok(term) if term.decode::<Atom>().ok() == Some(nil()) => Ok(None),
-        Ok(term) => decode_term(term).map(Some),
-        Err(_) => Ok(None),
-    }
-}
-
-fn map_get_optional_bool(map: Term, key: Atom) -> anyhow::Result<Option<bool>> {
-    match map_get(map, key) {
-        Ok(term) if term.decode::<Atom>().ok() == Some(nil()) => Ok(None),
-        Ok(term) => decode_term(term).map(Some),
-        Err(_) => Ok(None),
-    }
-}
-
-fn map_get_optional_atom(map: Term, key: Atom) -> anyhow::Result<Option<Atom>> {
-    match map_get(map, key) {
-        Ok(term) if term.decode::<Atom>().ok() == Some(nil()) => Ok(None),
-        Ok(term) => decode_term(term).map(Some),
-        Err(_) => Ok(None),
-    }
-}
-
-fn map_get_payloads_list(map: Term, key: Atom) -> anyhow::Result<Vec<Payload>> {
-    match map_get(map, key) {
-        Ok(term) if term.decode::<Atom>().ok() == Some(nil()) => Ok(vec![]),
-        Ok(term) => terms_list_to_payloads(term),
-        Err(_) => Ok(vec![]),
-    }
-}
-
-fn failure_cause_from_map(map: Term) -> anyhow::Result<Option<Box<Failure>>> {
-    match map_get(map, cause()) {
-        Ok(term) if term.decode::<Atom>().ok() == Some(nil()) => Ok(None),
-        Ok(term) => failure_from_term(term, "Temporalex caused failure")
-            .map(Box::new)
-            .map(Some),
-        Err(_) => Ok(None),
-    }
-}
-
 fn payloads_to_terms_option<'a>(
     env: Env<'a>,
     payloads: Option<&Payloads>,
@@ -2467,19 +1603,6 @@ fn retry_state_atom(retry_state: RetryState) -> Atom {
     }
 }
 
-fn retry_state_from_atom(retry_state: Option<Atom>) -> RetryState {
-    match retry_state {
-        Some(atom) if atom == in_progress() => RetryState::InProgress,
-        Some(atom) if atom == non_retryable_failure() => RetryState::NonRetryableFailure,
-        Some(atom) if atom == timeout() => RetryState::Timeout,
-        Some(atom) if atom == maximum_attempts_reached() => RetryState::MaximumAttemptsReached,
-        Some(atom) if atom == retry_policy_not_set() => RetryState::RetryPolicyNotSet,
-        Some(atom) if atom == internal_server_error() => RetryState::InternalServerError,
-        Some(atom) if atom == cancel_requested() => RetryState::CancelRequested,
-        _ => RetryState::Unspecified,
-    }
-}
-
 fn timeout_type_atom(timeout_type: TimeoutType) -> Atom {
     match timeout_type {
         TimeoutType::StartToClose => start_to_close(),
@@ -2487,16 +1610,6 @@ fn timeout_type_atom(timeout_type: TimeoutType) -> Atom {
         TimeoutType::ScheduleToClose => schedule_to_close(),
         TimeoutType::Heartbeat => heartbeat(),
         TimeoutType::Unspecified => unspecified(),
-    }
-}
-
-fn timeout_type_from_atom(timeout_type: Option<Atom>) -> TimeoutType {
-    match timeout_type {
-        Some(atom) if atom == start_to_close() => TimeoutType::StartToClose,
-        Some(atom) if atom == schedule_to_start() => TimeoutType::ScheduleToStart,
-        Some(atom) if atom == schedule_to_close() => TimeoutType::ScheduleToClose,
-        Some(atom) if atom == heartbeat() => TimeoutType::Heartbeat,
-        _ => TimeoutType::Unspecified,
     }
 }
 
@@ -2818,69 +1931,6 @@ fn retry_policy_from_term(term: Term) -> anyhow::Result<RetryPolicy> {
     })
 }
 
-fn versioning_intent_from_opts(opts: Term) -> anyhow::Result<VersioningIntent> {
-    let Some(term) = keyword_get(opts, versioning_intent())? else {
-        return Ok(VersioningIntent::Unspecified);
-    };
-
-    if term.decode::<Atom>().ok() == Some(nil()) {
-        return Ok(VersioningIntent::Unspecified);
-    }
-
-    let atom: Atom = decode_term(term)?;
-    if atom == unspecified() {
-        Ok(VersioningIntent::Unspecified)
-    } else if atom == compatible() {
-        Ok(VersioningIntent::Compatible)
-    } else if atom == default_atom() {
-        Ok(VersioningIntent::Default)
-    } else {
-        Err(anyhow!("unsupported continue-as-new versioning_intent"))
-    }
-}
-
-fn continue_as_new_versioning_behavior_from_opts(
-    opts: Term,
-) -> anyhow::Result<ContinueAsNewVersioningBehavior> {
-    let Some(term) = keyword_get(opts, initial_versioning_behavior())? else {
-        return Ok(ContinueAsNewVersioningBehavior::Unspecified);
-    };
-
-    if term.decode::<Atom>().ok() == Some(nil()) {
-        return Ok(ContinueAsNewVersioningBehavior::Unspecified);
-    }
-
-    let atom: Atom = decode_term(term)?;
-    if atom == unspecified() {
-        Ok(ContinueAsNewVersioningBehavior::Unspecified)
-    } else if atom == auto_upgrade() {
-        Ok(ContinueAsNewVersioningBehavior::AutoUpgrade)
-    } else if atom == use_ramping_version() {
-        Ok(ContinueAsNewVersioningBehavior::UseRampingVersion)
-    } else {
-        Err(anyhow!(
-            "unsupported continue-as-new initial_versioning_behavior"
-        ))
-    }
-}
-
-fn activity_cancellation_type_from_opts(opts: Term) -> anyhow::Result<ActivityCancellationType> {
-    let Some(term) = keyword_get(opts, cancellation_type())? else {
-        return Ok(ActivityCancellationType::WaitCancellationCompleted);
-    };
-
-    let atom: Atom = decode_term(term)?;
-    if atom == try_cancel() {
-        Ok(ActivityCancellationType::TryCancel)
-    } else if atom == wait_cancellation_completed() {
-        Ok(ActivityCancellationType::WaitCancellationCompleted)
-    } else if atom == abandon() {
-        Ok(ActivityCancellationType::Abandon)
-    } else {
-        Err(anyhow!("unsupported activity cancellation type"))
-    }
-}
-
 #[allow(deprecated)]
 fn workflow_id_reuse_policy_from_opts(opts: Term) -> anyhow::Result<WorkflowIdReusePolicy> {
     let Some(term) =
@@ -2963,26 +2013,6 @@ fn duration_option_from_opts(
     Ok(None)
 }
 
-fn proto_duration_option_from_opts(
-    opts: Term,
-    keys: &[Atom],
-) -> anyhow::Result<Option<prost_types::Duration>> {
-    for key in keys {
-        if let Some(ms) = keyword_get_i64(opts, *key)? {
-            if ms < 0 {
-                return Err(anyhow!("duration option must be non-negative"));
-            }
-            return Ok(Some(duration_from_ms(ms as u64)));
-        }
-    }
-
-    Ok(None)
-}
-
-fn map_get_non_negative_i64(map: Term, key: Atom, field_name: &str) -> anyhow::Result<u64> {
-    non_negative_millis(map_get_i64(map, key)?, field_name)
-}
-
 fn non_negative_millis(ms: i64, option_name: &str) -> anyhow::Result<u64> {
     if ms < 0 {
         Err(anyhow!("{option_name} must be non-negative"))
@@ -3007,25 +2037,6 @@ fn keyword_get(opts: Term, key: Atom) -> anyhow::Result<Option<Term>> {
     Ok(None)
 }
 
-fn map_get_string(map: Term, key: Atom) -> anyhow::Result<String> {
-    decode_term(map_get(map, key)?)
-}
-
-fn map_get_i64(map: Term, key: Atom) -> anyhow::Result<i64> {
-    decode_term(map_get(map, key)?)
-}
-
-fn force_cause_from_opts(opts: Term) -> WorkflowTaskFailedCause {
-    let Some(cause) = keyword_get(opts, force_cause()).ok().flatten() else {
-        return WorkflowTaskFailedCause::Unspecified;
-    };
-
-    match cause.decode::<Atom>().ok() {
-        Some(atom) if atom == nondeterminism() => WorkflowTaskFailedCause::NonDeterministicError,
-        _ => WorkflowTaskFailedCause::Unspecified,
-    }
-}
-
 fn duration_from_ms(ms: u64) -> prost_types::Duration {
     prost_types::Duration {
         seconds: (ms / 1000) as i64,
@@ -3033,101 +2044,8 @@ fn duration_from_ms(ms: u64) -> prost_types::Duration {
     }
 }
 
-fn duration_to_millis(duration: Option<&prost_types::Duration>) -> u64 {
-    duration
-        .map(|duration| {
-            (duration.seconds.max(0) as u64 * 1000) + (duration.nanos.max(0) as u64 / 1_000_000)
-        })
-        .unwrap_or(0)
-}
-
-fn nullable_duration_millis<'a>(
-    env: Env<'a>,
-    duration: Option<&prost_types::Duration>,
-) -> Term<'a> {
-    match duration {
-        Some(duration) => {
-            rustler::Encoder::encode(&(duration_to_millis(Some(duration)) as i64), env)
-        }
-        None => nil().encode(env),
-    }
-}
-
-fn timestamp_to_datetime<'a>(
-    env: Env<'a>,
-    timestamp: Option<&prost_types::Timestamp>,
-) -> anyhow::Result<Term<'a>> {
-    let Some(timestamp) = timestamp else {
-        return Ok(nil().encode(env));
-    };
-
-    let dt = OffsetDateTime::from_unix_timestamp(timestamp.seconds)
-        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
-        .replace_nanosecond(timestamp.nanos.max(0) as u32)
-        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
-
-    put_fields!(
-        make_struct(env, "Elixir.DateTime")?,
-        calendar_atom() => module_atom(env, "Elixir.Calendar.ISO")?,
-        year_atom() => dt.year() as i64,
-        month_atom() => dt.month() as u8 as i64,
-        day_atom() => dt.day() as i64,
-        hour_atom() => dt.hour() as i64,
-        minute_atom() => dt.minute() as i64,
-        second_atom() => dt.second() as i64,
-        microsecond_atom() => ((dt.nanosecond() / 1000) as i64, 6_i64),
-        time_zone_atom() => "Etc/UTC",
-        zone_abbr_atom() => "UTC",
-        utc_offset_atom() => 0_i64,
-        std_offset_atom() => 0_i64,
-    )
-}
-
-fn eviction_reason_atom(reason: EvictionReason) -> Atom {
-    match reason {
-        EvictionReason::CacheFull => cache_full(),
-        EvictionReason::CacheMiss => cache_miss(),
-        EvictionReason::Nondeterminism => nondeterminism(),
-        EvictionReason::LangFail => lang_fail(),
-        EvictionReason::LangRequested => lang_requested(),
-        EvictionReason::TaskNotFound => task_not_found(),
-        EvictionReason::UnhandledCommand => unhandled_command(),
-        EvictionReason::Fatal => fatal(),
-        EvictionReason::PaginationOrHistoryFetch => pagination_or_history_fetch(),
-        EvictionReason::WorkflowExecutionEnding => workflow_execution_ending(),
-        EvictionReason::Unspecified => unspecified(),
-    }
-}
-
-fn activity_cancel_reason(
-    reason: temporalio_common::protos::coresdk::activity_task::ActivityCancelReason,
-) -> Atom {
-    match reason {
-        temporalio_common::protos::coresdk::activity_task::ActivityCancelReason::Cancelled => {
-            cancelled()
-        }
-        temporalio_common::protos::coresdk::activity_task::ActivityCancelReason::TimedOut => {
-            timeout()
-        }
-        temporalio_common::protos::coresdk::activity_task::ActivityCancelReason::WorkerShutdown => {
-            shutdown()
-        }
-        temporalio_common::protos::coresdk::activity_task::ActivityCancelReason::NotFound
-        | temporalio_common::protos::coresdk::activity_task::ActivityCancelReason::Paused
-        | temporalio_common::protos::coresdk::activity_task::ActivityCancelReason::Reset => {
-            cancel()
-        }
-    }
-}
-
 fn make_struct<'a>(env: Env<'a>, module: &str) -> anyhow::Result<Term<'a>> {
     make_ex_struct(env, module).map_err(nif_error)
-}
-
-fn module_atom<'a>(env: Env<'a>, module: &str) -> anyhow::Result<Term<'a>> {
-    Atom::from_str(env, module)
-        .map(|atom| atom.encode(env))
-        .map_err(nif_error)
 }
 
 fn on_load(env: Env, _load_info: Term) -> bool {

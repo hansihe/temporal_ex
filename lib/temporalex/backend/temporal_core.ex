@@ -10,7 +10,7 @@ defmodule Temporalex.Backend.TemporalCore do
   @behaviour Temporalex.Backend
 
   alias Temporalex.Backend.TemporalCore.Codec
-  alias Temporalex.Backend.TemporalCore.PayloadConverter
+  alias Temporalex.Backend.TemporalCore.PollerBridge
   alias Temporalex.Core.ActivityCompletion
   alias Temporalex.Core.Completion
   alias Temporalex.Error
@@ -41,6 +41,7 @@ defmodule Temporalex.Backend.TemporalCore do
       :runtime,
       :client,
       :worker,
+      :poller_bridge,
       :owner_pid,
       :namespace,
       :task_queue,
@@ -99,32 +100,43 @@ defmodule Temporalex.Backend.TemporalCore do
     task_queue = Keyword.get(opts, :task_queue, client_state.task_queue)
     start_timeout = Keyword.get(opts, :start_timeout, @default_start_timeout)
 
-    with :ok <-
-           Native.start_worker(
-             client_state.runtime,
-             client_state.client,
-             task_queue,
-             client_state.namespace,
-             workflow_poller_count(opts),
-             activity_poller_count(opts),
-             owner_pid
-           ),
-         {:ok, worker} <- await_worker(start_timeout) do
-      {:ok,
-       %WorkerState{
-         runtime: client_state.runtime,
-         client: client_state.client,
-         worker: worker,
-         owner_pid: owner_pid,
-         namespace: client_state.namespace,
-         task_queue: task_queue,
-         start_timeout: start_timeout,
-         shutdown_timeout: Keyword.get(opts, :shutdown_timeout, @default_shutdown_timeout)
-       }}
-    else
-      {:error, reason} ->
-        {:error, Error.normalize_client_reason(reason, operation: :start_worker)}
+    {:ok, poller_bridge} = PollerBridge.start_link(owner_pid)
+
+    result =
+      with :ok <-
+             Native.start_worker(
+               client_state.runtime,
+               client_state.client,
+               task_queue,
+               client_state.namespace,
+               workflow_poller_count(opts),
+               activity_poller_count(opts),
+               owner_pid,
+               poller_bridge
+             ),
+           {:ok, worker} <- await_worker(start_timeout) do
+        {:ok,
+         %WorkerState{
+           runtime: client_state.runtime,
+           client: client_state.client,
+           worker: worker,
+           poller_bridge: poller_bridge,
+           owner_pid: owner_pid,
+           namespace: client_state.namespace,
+           task_queue: task_queue,
+           start_timeout: start_timeout,
+           shutdown_timeout: Keyword.get(opts, :shutdown_timeout, @default_shutdown_timeout)
+         }}
+      else
+        {:error, reason} ->
+          {:error, Error.normalize_client_reason(reason, operation: :start_worker)}
+      end
+
+    if match?({:error, _reason}, result) do
+      send(poller_bridge, :stop)
     end
+
+    result
   end
 
   @impl Temporalex.Backend
@@ -145,31 +157,32 @@ defmodule Temporalex.Backend.TemporalCore do
   @impl Temporalex.Backend
   def record_activity_heartbeat(%WorkerState{} = state, task_token, details)
       when is_binary(task_token) do
-    details_bytes =
-      if is_nil(details) do
-        nil
-      else
-        PayloadConverter.term_to_bytes(details)
-      end
-
-    Native.record_activity_heartbeat(state.worker, task_token, details_bytes)
+    with {:ok, bytes} <- Codec.activity_heartbeat_to_bytes(task_token, details) do
+      Native.record_activity_heartbeat(state.worker, bytes)
+    end
   end
 
   @impl Temporalex.Backend
   def shutdown_worker(%WorkerState{} = state) do
     Native.initiate_shutdown(state.worker)
 
-    with :ok <- Native.shutdown_worker(state.worker, self()) do
-      case await_shutdown(state.shutdown_timeout) do
-        :ok ->
-          :ok
+    try do
+      with :ok <- Native.shutdown_worker(state.worker, self()) do
+        case await_shutdown(state.shutdown_timeout) do
+          :ok ->
+            :ok
 
+          {:error, reason} ->
+            {:error, Error.normalize_client_reason(reason, operation: :shutdown_worker)}
+        end
+      else
         {:error, reason} ->
           {:error, Error.normalize_client_reason(reason, operation: :shutdown_worker)}
       end
-    else
-      {:error, reason} ->
-        {:error, Error.normalize_client_reason(reason, operation: :shutdown_worker)}
+    after
+      if is_pid(state.poller_bridge) do
+        send(state.poller_bridge, :stop)
+      end
     end
   end
 
