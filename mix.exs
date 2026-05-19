@@ -21,6 +21,7 @@ defmodule Temporalex.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
+      {:minipb, path: "../minipb"},
       {:rustler, "~> 0.37.3", runtime: false}
     ]
   end
