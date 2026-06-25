@@ -22,7 +22,7 @@ defmodule Temporalex.MixProject do
   defp deps do
     [
       {:jason, "~> 1.4"},
-      {:minipb, path: "../minipb"},
+      {:pb, "~> 0.1.0"},
       {:rustler, "~> 0.37.3", runtime: false}
     ]
   end

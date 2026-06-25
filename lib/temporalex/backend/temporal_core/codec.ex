@@ -611,7 +611,7 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
         do_not_eagerly_execute: command.do_not_eagerly_execute
       }
 
-      {:ok, %{variant: {:schedule_activity, schedule}}}
+      {:ok, %{variant: {:schedule_activity, drop_nil(schedule)}}}
     end
   end
 
@@ -664,7 +664,7 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
         initial_versioning_behavior: initial_versioning_behavior
       }
 
-      {:ok, %{variant: {:continue_as_new_workflow_execution, continue}}}
+      {:ok, %{variant: {:continue_as_new_workflow_execution, drop_nil(continue)}}}
     end
   end
 
@@ -942,13 +942,13 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
          {:ok, non_retryable_error_types} <-
            non_retryable_error_types_to_proto(policy.non_retryable_error_types) do
       {:ok,
-       %{
+       drop_nil(%{
          initial_interval: initial_interval,
          backoff_coefficient: backoff_coefficient,
          maximum_interval: maximum_interval,
          maximum_attempts: maximum_attempts,
          non_retryable_error_types: non_retryable_error_types
-       }}
+       })}
     end
   end
 
@@ -1031,7 +1031,12 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
   defp blank?(""), do: true
   defp blank?(_), do: false
 
-  defp format_error(%MiniPB.Error{} = error), do: Exception.message(error)
+  # PB routes a nil value on an adapted message field (e.g. google.protobuf.Duration)
+  # into the adapter rather than eliding it, so omit optional fields by dropping the
+  # key entirely instead of leaving it nil.
+  defp drop_nil(map), do: Map.reject(map, fn {_key, value} -> is_nil(value) end)
+
+  defp format_error(error) when is_exception(error), do: Exception.message(error)
   defp format_error(reason) when is_binary(reason), do: reason
   defp format_error(reason), do: inspect(reason)
 end
