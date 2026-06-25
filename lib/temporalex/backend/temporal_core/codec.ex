@@ -121,8 +121,8 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
   end
 
   defp encode(message, proto) do
-    case Schema.encode(message, proto) do
-      {:ok, iodata} -> {:ok, IO.iodata_to_binary(iodata)}
+    case Schema.encode(proto, message) do
+      {:ok, binary} -> {:ok, binary}
       {:error, error} -> {:error, format_error(error)}
     end
   rescue
@@ -130,7 +130,7 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
   end
 
   defp decode(message, bytes, opts) do
-    case Schema.decode(message, bytes, opts) do
+    case Schema.decode(bytes, message, opts) do
       {:ok, proto} -> {:ok, proto}
       {:error, error} -> {:error, format_error(error)}
     end
@@ -595,22 +595,21 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
          {:ok, retry_policy} <- retry_policy_to_proto(command.retry_policy),
          {:ok, cancellation_type} <-
            activity_cancellation_type_to_proto(command.cancellation_type) do
-      schedule =
-        compact(%{
-          seq: command.seq,
-          activity_id: command.activity_id,
-          activity_type: command.type,
-          task_queue: command.task_queue || default_task_queue,
-          headers: headers,
-          arguments: PayloadConverter.term_to_payloads_list(command.input || []),
-          schedule_to_close_timeout: schedule_to_close_timeout,
-          schedule_to_start_timeout: schedule_to_start_timeout,
-          start_to_close_timeout: start_to_close_timeout,
-          heartbeat_timeout: heartbeat_timeout,
-          retry_policy: retry_policy,
-          cancellation_type: cancellation_type,
-          do_not_eagerly_execute: command.do_not_eagerly_execute
-        })
+      schedule = %{
+        seq: command.seq,
+        activity_id: command.activity_id,
+        activity_type: command.type,
+        task_queue: command.task_queue || default_task_queue,
+        headers: headers,
+        arguments: PayloadConverter.term_to_payloads_list(command.input || []),
+        schedule_to_close_timeout: schedule_to_close_timeout,
+        schedule_to_start_timeout: schedule_to_start_timeout,
+        start_to_close_timeout: start_to_close_timeout,
+        heartbeat_timeout: heartbeat_timeout,
+        retry_policy: retry_policy,
+        cancellation_type: cancellation_type,
+        do_not_eagerly_execute: command.do_not_eagerly_execute
+      }
 
       {:ok, %{variant: {:schedule_activity, schedule}}}
     end
@@ -651,20 +650,19 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
          {:ok, versioning_intent} <- versioning_intent_to_proto(command.versioning_intent),
          {:ok, initial_versioning_behavior} <-
            continue_as_new_versioning_behavior_to_proto(command.initial_versioning_behavior) do
-      continue =
-        compact(%{
-          workflow_type: command.workflow_type || "",
-          task_queue: command.task_queue || "",
-          arguments: [PayloadConverter.term_to_payload(command.input)],
-          workflow_run_timeout: workflow_run_timeout,
-          workflow_task_timeout: workflow_task_timeout,
-          memo: memo,
-          headers: headers,
-          search_attributes: search_attributes,
-          retry_policy: retry_policy,
-          versioning_intent: versioning_intent,
-          initial_versioning_behavior: initial_versioning_behavior
-        })
+      continue = %{
+        workflow_type: command.workflow_type || "",
+        task_queue: command.task_queue || "",
+        arguments: [PayloadConverter.term_to_payload(command.input)],
+        workflow_run_timeout: workflow_run_timeout,
+        workflow_task_timeout: workflow_task_timeout,
+        memo: memo,
+        headers: headers,
+        search_attributes: search_attributes,
+        retry_policy: retry_policy,
+        versioning_intent: versioning_intent,
+        initial_versioning_behavior: initial_versioning_behavior
+      }
 
       {:ok, %{variant: {:continue_as_new_workflow_execution, continue}}}
     end
@@ -782,12 +780,12 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
         :non_empty -> non_empty(error.message, default_message)
       end
 
-    compact(%{
+    %{
       message: message,
       source: error.source || "Temporalex",
       stack_trace: error.stack_trace || "",
       cause: maybe_failure(error.cause, "Temporalex caused failure")
-    })
+    }
   end
 
   defp failure_proto(error, default_message, failure_info, opts \\ []) do
@@ -816,10 +814,10 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
       error,
       "Temporalex activity cancelled",
       {:canceled_failure_info,
-       compact(%{
+       %{
          details: %{payloads: PayloadConverter.term_to_payloads_list(error.details || [])},
          identity: error.identity || ""
-       })},
+       }},
       message: :nil_only
     )
   end
@@ -843,12 +841,12 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
       error,
       default_message,
       {:activity_failure_info,
-       compact(%{
+       %{
          identity: error.identity || "",
          activity_type: if(blank?(error.activity_type), do: nil, else: error.activity_type),
          activity_id: error.activity_id || "",
          retry_state: retry_state_to_proto(error.retry_state)
-       })}
+       }}
     )
   end
 
@@ -857,7 +855,7 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
       error,
       default_message,
       {:child_workflow_execution_failure_info,
-       compact(%{
+       %{
          namespace: error.namespace || "",
          workflow_execution:
            if(blank?(error.workflow_id) and blank?(error.run_id),
@@ -866,7 +864,7 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
            ),
          workflow_type: if(blank?(error.workflow_type), do: nil, else: error.workflow_type),
          retry_state: retry_state_to_proto(error.retry_state)
-       })}
+       }}
     )
   end
 
@@ -944,13 +942,13 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
          {:ok, non_retryable_error_types} <-
            non_retryable_error_types_to_proto(policy.non_retryable_error_types) do
       {:ok,
-       compact(%{
+       %{
          initial_interval: initial_interval,
          backoff_coefficient: backoff_coefficient,
          maximum_interval: maximum_interval,
          maximum_attempts: maximum_attempts,
          non_retryable_error_types: non_retryable_error_types
-       })}
+       }}
     end
   end
 
@@ -1032,10 +1030,6 @@ defmodule Temporalex.Backend.TemporalCore.Codec do
   defp blank?(nil), do: true
   defp blank?(""), do: true
   defp blank?(_), do: false
-
-  defp compact(map) do
-    Map.reject(map, fn {_key, value} -> is_nil(value) end)
-  end
 
   defp format_error(%MiniPB.Error{} = error), do: Exception.message(error)
   defp format_error(reason) when is_binary(reason), do: reason
